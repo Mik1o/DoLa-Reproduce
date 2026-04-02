@@ -1,0 +1,7 @@
+﻿model_name: "mistralai/Mistral-7B-Instruct-v0.2"
+device: "cuda"
+output_dir: "outputs/mistral7b_tfqa_dola"
+data_path: "data/TruthfulQA.csv"
+max_new_tokens: 32
+use_4bit: true
+dola_layers: [24, 26, 28, 30]

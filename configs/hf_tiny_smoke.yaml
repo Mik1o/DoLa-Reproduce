@@ -1,0 +1,8 @@
+task_name: "hf_tiny_smoke"
+model_name: "hf-internal-testing/tiny-random-gpt2"
+device: "cpu"
+prompt: "The capital of France is"
+max_new_tokens: 20
+do_sample: false
+use_safetensors: true
+output_dir: "outputs/hf_tiny_smoke"

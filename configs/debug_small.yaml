@@ -1,0 +1,9 @@
+task_name: "truthfulqa_mc_debug"
+model_name: "debug-placeholder-model"
+device: "cpu"
+output_dir: "outputs/debug_small"
+data_path: "tests/fixtures/truthfulqa_sample.csv"
+inspect_limit: 2
+max_new_tokens: 16
+use_4bit: false
+dola_layers: [28, 29, 30, 31]

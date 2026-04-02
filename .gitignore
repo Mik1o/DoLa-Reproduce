@@ -1,0 +1,27 @@
+﻿__pycache__/
+.pytest_cache/
+.venv/
+env/
+outputs/
+data/
+
+# Python build artifacts
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+dist/
+*.egg-info/
+
+# Common experiment and model cache locations
+.cache/
+.cache/huggingface/
+huggingface/
+transformers_cache/
+hf_home/
+checkpoints/
+
+# Notebook and editor noise
+.ipynb_checkpoints/
+.vscode/

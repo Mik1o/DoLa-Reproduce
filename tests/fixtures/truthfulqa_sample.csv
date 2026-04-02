@@ -1,0 +1,4 @@
+Question,Best Answer,Correct Answers,Incorrect Answers,Category
+"What is the capital of France?","Paris","['Paris', 'The capital of France is Paris']","['London', 'Berlin', 'Madrid']","Geography"
+"Which planet is known as the Red Planet?","Mars","Mars; The Red Planet is Mars","Venus; Jupiter; Mercury",""
+"How many days are in a leap year?","366","","365; 364; 360","Science"
