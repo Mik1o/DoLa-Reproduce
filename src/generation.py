@@ -49,7 +49,7 @@ def score_continuation_logprob(
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
 
-    prompt_text, input_ids, attention_mask, prompt_len = _prepare_scoring_inputs(
+    _, input_ids, attention_mask, prompt_len = _prepare_scoring_inputs(
         model=model,
         tokenizer=tokenizer,
         prompt=prompt,
@@ -213,20 +213,48 @@ def _prepare_scoring_inputs(
     if not candidate_answer.strip():
         raise ValueError("candidate_answer must be a non-empty string.")
 
-    prompt_text = prompt if prompt.endswith((" ", "\n", "\t")) else f"{prompt}{separator}"
-    full_text = f"{prompt_text}{candidate_answer}"
+    cleaned_candidate = candidate_answer.lstrip()
+    attempts = _build_scoring_text_attempts(prompt, cleaned_candidate, separator)
 
-    prompt_batch = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
-    full_batch = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
+    for prompt_text, full_text in attempts:
+        prompt_batch = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        full_batch = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
 
-    prompt_len = int(prompt_batch["input_ids"].shape[1])
-    full_len = int(full_batch["input_ids"].shape[1])
-    if full_len <= prompt_len:
-        raise ValueError("candidate_answer did not add any continuation tokens.")
+        prompt_len = int(prompt_batch["input_ids"].shape[1])
+        full_len = int(full_batch["input_ids"].shape[1])
+        if full_len > prompt_len:
+            input_ids = full_batch["input_ids"].to(model.device)
+            attention_mask = full_batch["attention_mask"].to(model.device)
+            return prompt_text, input_ids, attention_mask, prompt_len
 
-    input_ids = full_batch["input_ids"].to(model.device)
-    attention_mask = full_batch["attention_mask"].to(model.device)
-    return prompt_text, input_ids, attention_mask, prompt_len
+    raise ValueError(
+        "candidate_answer did not add any continuation tokens after scoring-boundary fallback. "
+        f"prompt={prompt!r}, candidate_answer={candidate_answer!r}"
+    )
+
+
+
+def _build_scoring_text_attempts(
+    prompt: str,
+    candidate_answer: str,
+    separator: str,
+) -> list[tuple[str, str]]:
+    """Build prompt/full-text attempts with slightly different token boundaries."""
+    normalized_separator = separator or " "
+    normalized_candidate = candidate_answer.lstrip()
+
+    primary_prompt = prompt if prompt[-1].isspace() else f"{prompt}{normalized_separator}"
+    fallback_prompt = f"{prompt.rstrip()}{normalized_separator}"
+
+    attempts: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for prompt_text in (primary_prompt, fallback_prompt):
+        full_text = f"{prompt_text}{normalized_candidate}"
+        pair = (prompt_text, full_text)
+        if pair not in seen:
+            seen.add(pair)
+            attempts.append(pair)
+    return attempts
 
 
 

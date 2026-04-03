@@ -1,5 +1,5 @@
 task_name: "mistral7b_smoke"
-model_name: "mistralai/Mistral-7B-v0.1"
+model_name: "/home/yifei/DoLa-Reproduce/models/Mistral-7B-v0.1"
 device: "cuda"
 torch_dtype: "float16"
 use_fast_tokenizer: true
