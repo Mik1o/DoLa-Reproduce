@@ -21,6 +21,7 @@ def test_parse_list_field_accepts_common_formats() -> None:
     assert parse_list_field("") == []
 
 
+
 def test_load_truthfulqa_samples_normalizes_rows() -> None:
     """Fixture rows should load into the expected internal sample structure."""
     samples = load_truthfulqa_samples(FIXTURE_CSV)
@@ -47,3 +48,15 @@ def test_build_mc_prompt_contains_question_and_options() -> None:
     assert "A. Paris" in prompt
     assert "B. London" in prompt
     assert prompt.rstrip().endswith("Answer:")
+
+
+
+def test_build_mc_prompt_supports_tinyllama_chat_style() -> None:
+    """A small chat-style prompt variant should be available by config."""
+    sample = load_truthfulqa_samples(FIXTURE_CSV)[0]
+    prompt = build_mc_prompt(sample, prompt_style="tinyllama_chat_mc")
+
+    assert "<|system|>" in prompt
+    assert "<|user|>" in prompt
+    assert "<|assistant|>" in prompt
+    assert "Question: What is the capital of France?" in prompt

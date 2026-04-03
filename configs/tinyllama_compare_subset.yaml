@@ -1,0 +1,9 @@
+task_name: "tinyllama_compare_subset"
+model_name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+device: "cuda"
+torch_dtype: "float16"
+prompt_style: "tinyllama_chat_mc"
+csv_path: "tests/fixtures/truthfulqa_sample.csv"
+max_samples: 2
+premature_layer: 2
+output_dir: "outputs/tinyllama_compare_subset"

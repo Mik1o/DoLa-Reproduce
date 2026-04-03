@@ -1,6 +1,39 @@
-﻿"""Helpers for selecting and validating DoLa-related settings."""
+"""Helpers for minimal DoLa-style layer pairing and validation."""
 
 from __future__ import annotations
+
+
+
+def validate_premature_layer(premature_layer: int, num_hidden_layers: int) -> None:
+    """Validate a zero-based premature layer index for DoLa-style scoring."""
+    if num_hidden_layers <= 1:
+        raise ValueError("num_hidden_layers must be greater than 1 for DoLa-style scoring.")
+    if premature_layer < 0:
+        raise ValueError("premature_layer must be a non-negative integer.")
+    if premature_layer >= num_hidden_layers - 1:
+        raise ValueError(
+            "premature_layer must be smaller than the mature final layer index "
+            f"({num_hidden_layers - 1})."
+        )
+
+
+
+def get_mature_layer_index(num_hidden_layers: int) -> int:
+    """Return the zero-based mature layer index for the model's final layer."""
+    if num_hidden_layers <= 0:
+        raise ValueError("num_hidden_layers must be positive.")
+    return num_hidden_layers - 1
+
+
+
+def describe_dola_pair(premature_layer: int, mature_layer: int) -> str:
+    """Return a short text description of the selected DoLa layer pair."""
+    if premature_layer < 0 or mature_layer < 0:
+        raise ValueError("Layer indices must be non-negative integers.")
+    if premature_layer >= mature_layer:
+        raise ValueError("premature_layer must be smaller than mature_layer.")
+    return f"premature_layer={premature_layer}, mature_layer={mature_layer}"
+
 
 
 def select_dola_layers(
@@ -17,6 +50,7 @@ def select_dola_layers(
     # TODO: replace this placeholder heuristic with experiment-driven selection.
     start = max(total_layers - count, 0)
     return list(range(start, total_layers))
+
 
 
 def validate_dola_layers(dola_layers: list[int] | None) -> list[int]:

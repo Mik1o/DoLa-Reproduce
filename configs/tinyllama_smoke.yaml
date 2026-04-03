@@ -1,0 +1,9 @@
+task_name: "tinyllama_smoke"
+model_name: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+device: "cuda"
+torch_dtype: "float16"
+prompt_style: "tinyllama_chat_mc"
+prompt: "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nAnswer the following question briefly and clearly.\nQuestion: What is the capital of France?</s>\n<|assistant|>\n"
+max_new_tokens: 32
+do_sample: false
+output_dir: "outputs/tinyllama_smoke"

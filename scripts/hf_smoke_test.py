@@ -16,6 +16,16 @@ from src.modeling import load_model_and_tokenizer
 from src.utils import ensure_output_dir, load_yaml_config
 
 
+LOAD_CONFIG_KEYS = (
+    "use_safetensors",
+    "torch_dtype",
+    "use_fast_tokenizer",
+    "trust_remote_code",
+    "attn_implementation",
+)
+
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the HF smoke test."""
     parser = argparse.ArgumentParser(
@@ -28,6 +38,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to a YAML config file.",
     )
     return parser.parse_args()
+
 
 
 def main() -> None:
@@ -44,9 +55,7 @@ def main() -> None:
     max_new_tokens = int(config.get("max_new_tokens", 20))
     do_sample = bool(config.get("do_sample", False))
 
-    model_kwargs: dict[str, object] = {}
-    if "use_safetensors" in config:
-        model_kwargs["use_safetensors"] = bool(config["use_safetensors"])
+    model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
     print(f"[hf_smoke_test] Model: {model_name}")
     print(f"[hf_smoke_test] Device: {device}")

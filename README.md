@@ -14,9 +14,15 @@ The project is being organized so future code can move smoothly across:
 ## Current Stage
 
 The project now includes lightweight scaffolding, local environment checks,
-TruthfulQA-MC data normalization, and one tiny Hugging Face vanilla generation
-smoke test. It still does **not** implement DoLa, TruthfulQA scoring, or any
-7B experiment workflow.
+TruthfulQA-MC data normalization, a tiny Hugging Face vanilla generation
+smoke test, single-sample candidate scoring, a small vanilla subset
+evaluation loop with averaged MC metrics, a single-sample vanilla vs
+DoLa-style comparison prototype, and a small-subset vanilla vs DoLa-style
+comparison workflow. It also supports switching from the tiny-random model to
+TinyLlama for a more realistic small-model comparison setup, and now includes
+7B-ready config templates plus WSL run guidance for `mistralai/Mistral-7B-v0.1`.
+It still does **not** implement 7B full experiments, dynamic layer selection,
+or the full DoLa paper setup.
 
 ## Directory Layout
 
@@ -24,6 +30,7 @@ smoke test. It still does **not** implement DoLa, TruthfulQA scoring, or any
 .
 |-- configs/
 |-- data/
+|-- docs/
 |-- outputs/
 |-- scripts/
 |-- src/
@@ -35,6 +42,7 @@ smoke test. It still does **not** implement DoLa, TruthfulQA scoring, or any
 - `configs/`: YAML configuration examples with a consistent field layout.
 - `tests/`: lightweight tests, currently focused on import-level checks.
 - `data/`: local datasets and intermediate data files.
+- `docs/`: short runbooks for moving experiments onto other machines.
 - `outputs/`: run outputs, logs, and artifacts from future experiments.
 
 ## What Exists Right Now
@@ -44,14 +52,20 @@ smoke test. It still does **not** implement DoLa, TruthfulQA scoring, or any
 - output directory creation,
 - import-safe script entry points,
 - TruthfulQA-MC data loading and prompt construction,
-- one tiny Hugging Face causal LM smoke path.
+- one tiny Hugging Face causal LM smoke path,
+- single-sample candidate scoring plus MC1/MC2/MC3,
+- small-subset vanilla evaluation with JSON result saving,
+- single-sample vanilla vs DoLa-style comparison,
+- small-subset vanilla vs DoLa-style comparison with saved summaries,
+- configuration-driven switching between tiny-random and TinyLlama,
+- 7B-ready config templates for WSL smoke and compare runs.
 
 ## What Comes Next
 
 Later iterations will add:
 
-- DoLa-specific generation logic,
-- TruthfulQA candidate scoring and metrics,
+- broader DoLa evaluation flows,
+- larger TruthfulQA experiment loops,
 - larger baseline experiment plumbing.
 
 ## Minimal Setup
@@ -110,8 +124,7 @@ scaffold.
 
 The project includes the data-input side of TruthfulQA-MC: CSV loading,
 row normalization into a lightweight internal sample structure, and a simple
-multiple-choice prompt builder for inspection. This still does **not** include
-model-based scoring.
+multiple-choice prompt builder for inspection.
 
 Run the data inspection script with:
 
@@ -133,6 +146,99 @@ Then run:
 python scripts/hf_smoke_test.py --config configs/hf_tiny_smoke.yaml
 ```
 
-This stage only covers a tiny Hugging Face causal LM load plus one vanilla
-`generate` call. It still does **not** implement DoLa, TruthfulQA scoring, or
-any 7B baseline experiment flow.
+## Single-Sample MC Scoring
+
+The project supports scoring one TruthfulQA-style sample with a tiny causal
+LM by summing continuation log-probabilities for true and false candidates, then
+computing MC1, MC2, and MC3.
+
+Run the single-sample scoring script with:
+
+```bash
+python scripts/hf_score_single_mc.py --config configs/hf_tiny_score_single.yaml
+```
+
+## Small-Subset MC Evaluation
+
+The project supports running vanilla MC evaluation over the first N samples
+from a TruthfulQA-style CSV, averaging MC1/MC2/MC3, and saving results to:
+
+- `sample_results.jsonl`
+- `summary.json`
+
+Run the subset evaluation script with:
+
+```bash
+python scripts/hf_eval_mc_subset.py --config configs/hf_tiny_eval_subset.yaml
+```
+
+## Single-Sample Vanilla vs DoLa-Style Compare
+
+The project supports a minimal DoLa-style prototype for one sample: one
+premature layer, one mature final layer, and contrastive candidate scoring via
+`mature logits - premature logits`.
+
+Run the compare script with:
+
+```bash
+python scripts/hf_compare_single_mc.py --config configs/hf_tiny_compare_single.yaml
+```
+
+## Small-Subset Vanilla vs DoLa-Style Compare
+
+The project supports comparing vanilla and DoLa-style MC scoring over the
+first N samples of a small subset. The script writes:
+
+- `compare_sample_results.jsonl`
+- `compare_summary.json`
+
+Run it with:
+
+```bash
+python scripts/hf_eval_compare_subset.py --config configs/hf_tiny_compare_subset.yaml
+```
+
+## TinyLlama Configs
+
+In addition to the tiny-random fallback configs, the project now includes a
+more realistic small public model setup based on `TinyLlama/TinyLlama-1.1B-Chat-v1.0`.
+Use these configs to reuse the same scripts without changing the core logic:
+
+```bash
+python scripts/hf_smoke_test.py --config configs/tinyllama_smoke.yaml
+python scripts/hf_compare_single_mc.py --config configs/tinyllama_compare_single.yaml
+python scripts/hf_eval_compare_subset.py --config configs/tinyllama_compare_subset.yaml
+```
+
+## WSL 7B Baseline Prep
+
+The project now also includes 7B-ready config templates for
+`mistralai/Mistral-7B-v0.1`. These are meant for the WSL2 + RTX 5080 machine,
+not for full experiments yet:
+
+```bash
+python scripts/hf_smoke_test.py --config configs/mistral7b_smoke.yaml
+python scripts/hf_compare_single_mc.py --config configs/mistral7b_compare_single.yaml
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_compare_subset.yaml
+```
+
+For the step-by-step WSL setup order, see `docs/wsl_7b_runbook.md`.
+This is still baseline-prep only: no full TruthfulQA run, no 7B layer sweep,
+and no final formal experiment pipeline yet.
+
+## Premature-Layer Sweep
+
+The project supports scanning several fixed premature layers over a small
+subset and saving the layer-by-layer summaries to:
+
+- `layer_sweep_results.jsonl`
+- `best_layer_summary.json`
+
+Run it with:
+
+```bash
+python scripts/hf_sweep_premature_layers.py --config configs/tinyllama_sweep_subset.yaml
+```
+
+This is an analysis-only sweep. It does **not** implement dynamic layer
+selection, quantization, or the full DoLa paper variant.

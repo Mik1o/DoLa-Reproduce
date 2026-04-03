@@ -20,8 +20,6 @@ OPTION_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 @dataclass(slots=True)
 class TruthfulQASample:
-    """Normalized TruthfulQA multiple-choice sample."""
-
     question: str
     best_answer: str
     correct_answers: list[str]
@@ -29,8 +27,20 @@ class TruthfulQASample:
     category: str | None
 
 
+@dataclass(slots=True)
+class TruthfulQAEvalResult:
+    question: str
+    prompt: str
+    true_candidates: list[str]
+    false_candidates: list[str]
+    scores_true: list[float]
+    scores_false: list[float]
+    mc1: float
+    mc2: float
+    mc3: float
+
+
 def load_truthfulqa_csv(csv_path: str | Path) -> pd.DataFrame:
-    """Load a TruthfulQA-style CSV file into a DataFrame."""
     path = Path(csv_path)
     if not path.is_file():
         raise FileNotFoundError(f"TruthfulQA CSV file not found: {path}")
@@ -38,11 +48,6 @@ def load_truthfulqa_csv(csv_path: str | Path) -> pd.DataFrame:
 
 
 def parse_list_field(raw: str | None) -> list[str]:
-    """Parse a TruthfulQA list-like field into a clean list of strings.
-
-    The parser accepts common list-literal strings such as ``['a', 'b']`` as
-    well as simple delimiter-based forms like ``a; b``.
-    """
     if _is_missing(raw):
         return []
     if not isinstance(raw, str):
@@ -64,7 +69,6 @@ def parse_list_field(raw: str | None) -> list[str]:
 
 
 def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
-    """Normalize a CSV row into a lightweight internal TruthfulQA sample."""
     question = _get_required_text(row, QUESTION_FIELDS)
     best_answer = _get_required_text(row, BEST_ANSWER_FIELDS)
     correct_answers = parse_list_field(_get_optional_value(row, CORRECT_ANSWER_FIELDS))
@@ -91,13 +95,33 @@ def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
 
 
 def load_truthfulqa_samples(csv_path: str | Path) -> list[TruthfulQASample]:
-    """Load and normalize all samples from a TruthfulQA-style CSV file."""
     dataframe = load_truthfulqa_csv(csv_path)
     return [normalize_truthfulqa_row(row) for _, row in dataframe.iterrows()]
 
 
-def build_mc_prompt(sample: TruthfulQASample) -> str:
-    """Build a simple multiple-choice prompt for manual inspection or future runs."""
+def get_mc_candidate_sets(sample: TruthfulQASample) -> tuple[list[str], list[str]]:
+    true_candidates = _dedupe_preserve_order([sample.best_answer, *sample.correct_answers])
+    false_candidates = _dedupe_preserve_order(sample.incorrect_answers)
+    return true_candidates, false_candidates
+
+
+def build_mc_prompt(sample: TruthfulQASample, prompt_style: str = "plain_mc") -> str:
+    plain_prompt = _build_plain_mc_prompt(sample)
+    normalized_style = prompt_style.strip().lower()
+    if normalized_style == "plain_mc":
+        return plain_prompt
+    if normalized_style == "tinyllama_chat_mc":
+        return (
+            "<|system|>\nYou are a helpful assistant.</s>\n"
+            f"<|user|>\n{plain_prompt}</s>\n"
+            "<|assistant|>\n"
+        )
+    raise ValueError(
+        f"Unsupported prompt_style '{prompt_style}'. Use 'plain_mc' or 'tinyllama_chat_mc'."
+    )
+
+
+def _build_plain_mc_prompt(sample: TruthfulQASample) -> str:
     options = _dedupe_preserve_order([sample.best_answer, *sample.incorrect_answers])
     if len(options) > len(OPTION_LABELS):
         raise ValueError("Too many answer options for the current prompt label set.")
@@ -114,7 +138,6 @@ def build_mc_prompt(sample: TruthfulQASample) -> str:
 
 
 def _get_required_text(row: pd.Series, field_names: tuple[str, ...]) -> str:
-    """Return a required text field from a row or raise a clear error."""
     value = _get_optional_value(row, field_names)
     if _is_missing(value):
         field_list = ", ".join(field_names)
@@ -129,7 +152,6 @@ def _get_required_text(row: pd.Series, field_names: tuple[str, ...]) -> str:
 
 
 def _get_optional_text(row: pd.Series, field_names: tuple[str, ...]) -> str | None:
-    """Return an optional text field from a row."""
     value = _get_optional_value(row, field_names)
     if _is_missing(value):
         return None
@@ -140,7 +162,6 @@ def _get_optional_text(row: pd.Series, field_names: tuple[str, ...]) -> str | No
 
 
 def _get_optional_value(row: pd.Series, field_names: tuple[str, ...]) -> Any:
-    """Return the first matching field value from a row."""
     for field_name in field_names:
         if field_name in row.index:
             return row[field_name]
@@ -148,7 +169,6 @@ def _get_optional_value(row: pd.Series, field_names: tuple[str, ...]) -> Any:
 
 
 def _parse_literal_list(text: str) -> list[str] | None:
-    """Parse a Python-style list literal if present."""
     is_literal = (
         (text.startswith("[") and text.endswith("]"))
         or (text.startswith("(") and text.endswith(")"))
@@ -169,7 +189,6 @@ def _parse_literal_list(text: str) -> list[str] | None:
 
 
 def _split_and_clean(items: Any) -> list[str]:
-    """Strip whitespace and drop empty values from a sequence of strings."""
     cleaned: list[str] = []
     for item in items:
         text = str(item).strip()
@@ -179,7 +198,6 @@ def _split_and_clean(items: Any) -> list[str]:
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
-    """Deduplicate a list of strings while preserving order."""
     seen: set[str] = set()
     deduped: list[str] = []
     for item in items:
@@ -190,7 +208,6 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
 
 
 def _is_missing(value: object) -> bool:
-    """Return True when a scalar field should be treated as missing."""
     if value is None:
         return True
     if isinstance(value, str):

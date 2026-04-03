@@ -1,0 +1,7 @@
+task_name: "hf_tiny_score_single"
+model_name: "hf-internal-testing/tiny-random-gpt2"
+device: "cuda"
+csv_path: "tests/fixtures/truthfulqa_sample.csv"
+sample_index: 0
+use_safetensors: true
+output_dir: "outputs/hf_tiny_score_single"

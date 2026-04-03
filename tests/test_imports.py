@@ -16,7 +16,12 @@ CORE_MODULES = [
 
 SCRIPT_MODULES = [
     "scripts.check_env",
+    "scripts.hf_compare_single_mc",
+    "scripts.hf_eval_compare_subset",
+    "scripts.hf_eval_mc_subset",
+    "scripts.hf_score_single_mc",
     "scripts.hf_smoke_test",
+    "scripts.hf_sweep_premature_layers",
     "scripts.inspect_truthfulqa_data",
     "scripts.run_tfqa_mc_dola",
     "scripts.run_tfqa_mc_vanilla",
@@ -28,6 +33,7 @@ def test_import_core_modules() -> None:
     """Ensure the main source modules are importable."""
     for module_name in CORE_MODULES:
         assert importlib.import_module(module_name) is not None
+
 
 
 def test_import_script_modules() -> None:

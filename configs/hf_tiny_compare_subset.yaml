@@ -1,0 +1,8 @@
+task_name: "hf_tiny_compare_subset"
+model_name: "hf-internal-testing/tiny-random-gpt2"
+device: "cuda"
+csv_path: "tests/fixtures/truthfulqa_sample.csv"
+max_samples: 2
+premature_layer: 0
+use_safetensors: true
+output_dir: "outputs/hf_tiny_compare_subset"
