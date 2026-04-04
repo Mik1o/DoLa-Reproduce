@@ -60,7 +60,8 @@ or the full DoLa paper setup.
 - configuration-driven switching between tiny-random and TinyLlama,
 - 7B-ready config templates for WSL smoke and compare runs,
 - a real TruthfulQA.csv small-subset path for 7B compare runs,
-- two TruthfulQA prompt modes: `options_mc` and `direct_answer_mc`.
+- two TruthfulQA prompt modes: `options_mc` and `direct_answer_mc`,
+- two scoring aggregation modes: `sum_logprob` and `mean_logprob`.
 
 ## What Comes Next
 
@@ -210,6 +211,15 @@ The project now supports two TruthfulQA scoring prompt modes:
 For baseline-focused reproduction work, prefer trying `direct_answer_mc` first.
 This still does **not** run the full TruthfulQA benchmark or any layer sweep.
 
+## Scoring Modes
+
+The project now supports two candidate scoring aggregation modes:
+
+- `sum_logprob`: raw continuation log-prob sum. This is the default and preserves previous behavior.
+- `mean_logprob`: continuation log-prob sum divided by the scored continuation token count.
+
+`mean_logprob` is not a new algorithm. It is only a diagnostic control for checking whether direct-answer scoring is being dominated by answer-length bias. A good next step is to compare both modes on the same real-data subset before doing anything larger.
+
 ## TinyLlama Configs
 
 In addition to the tiny-random fallback configs, the project now includes a
@@ -245,10 +255,12 @@ Recommended order:
 
 1. Preview the real CSV first.
 2. Then run the small subset compare config.
+3. Compare `sum_logprob` and `mean_logprob` on the same subset.
 
 ```bash
 python scripts/inspect_truthfulqa_real_csv.py --csv data/truthfulqa/TruthfulQA.csv --limit 3 --prompt-style direct_answer_mc
 python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_direct.yaml
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_direct_mean.yaml
 ```
 
 This still does **not** do a full TruthfulQA run, a 7B layer sweep, or a

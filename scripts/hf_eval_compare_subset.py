@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dola_utils import describe_dola_pair, get_mature_layer_index, validate_premature_layer
-from src.generation import score_candidate_answers, score_candidate_answers_dola
+from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
 from src.metrics import (
     aggregate_mc_metrics,
     compare_aggregate_metrics,
@@ -51,6 +51,19 @@ def parse_args() -> argparse.Namespace:
 
 
 
+def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
+    """Convert candidate score objects into JSON-friendly dictionaries."""
+    return [
+        {
+            "candidate": item.candidate,
+            "score": item.score,
+            "continuation_token_count": item.continuation_token_count,
+        }
+        for item in items
+    ]
+
+
+
 def evaluate_compare_subset(
     model: Any,
     tokenizer: Any,
@@ -59,6 +72,7 @@ def evaluate_compare_subset(
     max_samples: int,
     premature_layer: int,
     prompt_style: str,
+    score_mode: str,
 ) -> tuple[list[dict[str, object]], dict[str, float | int | str]]:
     """Evaluate vanilla vs DoLa-style scoring on the first N samples."""
     if max_samples <= 0:
@@ -81,31 +95,45 @@ def evaluate_compare_subset(
         prompt = build_mc_prompt(sample, prompt_style=prompt_style)
         true_candidates, false_candidates = get_mc_candidate_sets(sample)
 
-        vanilla_true = score_candidate_answers(model, tokenizer, prompt, true_candidates)
-        vanilla_false = score_candidate_answers(model, tokenizer, prompt, false_candidates)
+        vanilla_true = score_candidate_answers_with_details(
+            model,
+            tokenizer,
+            prompt,
+            true_candidates,
+            score_mode=score_mode,
+        )
+        vanilla_false = score_candidate_answers_with_details(
+            model,
+            tokenizer,
+            prompt,
+            false_candidates,
+            score_mode=score_mode,
+        )
         vanilla_metrics = compute_mc_metrics(
-            [score for _, score in vanilla_true],
-            [score for _, score in vanilla_false],
+            [item.score for item in vanilla_true],
+            [item.score for item in vanilla_false],
         )
         vanilla_metric_rows.append(vanilla_metrics)
 
-        dola_true = score_candidate_answers_dola(
+        dola_true = score_candidate_answers_dola_with_details(
             model,
             tokenizer,
             prompt,
             true_candidates,
             premature_layer=premature_layer,
+            score_mode=score_mode,
         )
-        dola_false = score_candidate_answers_dola(
+        dola_false = score_candidate_answers_dola_with_details(
             model,
             tokenizer,
             prompt,
             false_candidates,
             premature_layer=premature_layer,
+            score_mode=score_mode,
         )
         dola_metrics = compute_mc_metrics(
-            [score for _, score in dola_true],
-            [score for _, score in dola_false],
+            [item.score for item in dola_true],
+            [item.score for item in dola_false],
         )
         dola_metric_rows.append(dola_metrics)
 
@@ -115,16 +143,17 @@ def evaluate_compare_subset(
                 "question": sample.question,
                 "prompt": prompt,
                 "prompt_style": prompt_style,
+                "score_mode": score_mode,
                 "premature_layer": premature_layer,
                 "mature_layer": mature_layer,
                 "vanilla": {
-                    "true_scores": [{"candidate": c, "score": s} for c, s in vanilla_true],
-                    "false_scores": [{"candidate": c, "score": s} for c, s in vanilla_false],
+                    "true_scores": _serialize_candidate_scores(vanilla_true),
+                    "false_scores": _serialize_candidate_scores(vanilla_false),
                     "metrics": vanilla_metrics,
                 },
                 "dola": {
-                    "true_scores": [{"candidate": c, "score": s} for c, s in dola_true],
-                    "false_scores": [{"candidate": c, "score": s} for c, s in dola_false],
+                    "true_scores": _serialize_candidate_scores(dola_true),
+                    "false_scores": _serialize_candidate_scores(dola_false),
                     "metrics": dola_metrics,
                 },
             }
@@ -136,6 +165,7 @@ def evaluate_compare_subset(
     comparison_summary.update(
         {
             "prompt_style": prompt_style,
+            "score_mode": score_mode,
             "premature_layer": premature_layer,
             "mature_layer": mature_layer,
             "dola_pair": pair_description,
@@ -159,6 +189,7 @@ def main() -> None:
     max_samples = int(config.get("max_samples", 1))
     premature_layer = int(config["premature_layer"])
     prompt_style = str(config.get("prompt_style", "plain_mc"))
+    score_mode = str(config.get("score_mode", "sum_logprob"))
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
@@ -166,6 +197,7 @@ def main() -> None:
 
     print(f"[hf_eval_compare_subset] Model: {model_name}")
     print(f"[hf_eval_compare_subset] Device: {device}")
+    print(f"[hf_eval_compare_subset] Score mode: {score_mode}")
     print(f"[hf_eval_compare_subset] Loaded samples: {len(samples)}")
     print(f"[hf_eval_compare_subset] Evaluating first {min(len(samples), max_samples)} samples")
     print(f"[hf_eval_compare_subset] Output directory: {output_dir}")
@@ -183,6 +215,7 @@ def main() -> None:
         max_samples=max_samples,
         premature_layer=premature_layer,
         prompt_style=prompt_style,
+        score_mode=score_mode,
     )
 
     for result in sample_results:

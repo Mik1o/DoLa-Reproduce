@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 from src.dola_utils import get_mature_layer_index, validate_premature_layer
+
+
+@dataclass(slots=True)
+class CandidateScore:
+    candidate: str
+    score: float
+    continuation_token_count: int
 
 
 
@@ -39,8 +47,80 @@ def score_continuation_logprob(
     prompt: str,
     candidate_answer: str,
     separator: str = " ",
+    score_mode: str = "sum_logprob",
 ) -> float:
-    """Score a candidate continuation by summing token log-probabilities."""
+    """Score a candidate continuation with configurable log-prob aggregation."""
+    return score_continuation_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answer=candidate_answer,
+        separator=separator,
+        score_mode=score_mode,
+    ).score
+
+
+
+def score_candidate_answers(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answers: list[str],
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> list[tuple[str, float]]:
+    """Score each candidate answer for a shared prompt."""
+    return [
+        (item.candidate, item.score)
+        for item in score_candidate_answers_with_details(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            candidate_answers=candidate_answers,
+            separator=separator,
+            score_mode=score_mode,
+        )
+    ]
+
+
+
+def score_candidate_answers_with_details(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answers: list[str],
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> list[CandidateScore]:
+    """Score each candidate answer and keep continuation token counts."""
+    if not candidate_answers:
+        raise ValueError("candidate_answers must contain at least one answer.")
+
+    scored_candidates: list[CandidateScore] = []
+    for candidate_answer in candidate_answers:
+        scored_candidates.append(
+            score_continuation_details(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                candidate_answer=candidate_answer,
+                separator=separator,
+                score_mode=score_mode,
+            )
+        )
+    return scored_candidates
+
+
+
+def score_continuation_details(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answer: str,
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> CandidateScore:
+    """Score one candidate continuation and return score plus token length."""
     try:
         import torch
     except ImportError as error:
@@ -62,33 +142,16 @@ def score_continuation_logprob(
         logits = outputs.logits[:, :-1, :]
         token_log_probs = _gather_token_log_probs(logits, input_ids)
 
-    continuation_score = token_log_probs[:, _get_continuation_start_index(prompt_len) :].sum().item()
-    return float(continuation_score)
-
-
-
-def score_candidate_answers(
-    model: Any,
-    tokenizer: Any,
-    prompt: str,
-    candidate_answers: list[str],
-    separator: str = " ",
-) -> list[tuple[str, float]]:
-    """Score each candidate answer for a shared prompt."""
-    if not candidate_answers:
-        raise ValueError("candidate_answers must contain at least one answer.")
-
-    scored_candidates: list[tuple[str, float]] = []
-    for candidate_answer in candidate_answers:
-        score = score_continuation_logprob(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            candidate_answer=candidate_answer,
-            separator=separator,
-        )
-        scored_candidates.append((candidate_answer, score))
-    return scored_candidates
+    continuation_log_probs = token_log_probs[:, _get_continuation_start_index(prompt_len) :]
+    score, continuation_token_count = _aggregate_continuation_log_probs(
+        continuation_log_probs=continuation_log_probs,
+        score_mode=score_mode,
+    )
+    return CandidateScore(
+        candidate=candidate_answer,
+        score=score,
+        continuation_token_count=continuation_token_count,
+    )
 
 
 
@@ -99,8 +162,86 @@ def score_continuation_dola_logprob(
     candidate_answer: str,
     premature_layer: int,
     separator: str = " ",
+    score_mode: str = "sum_logprob",
 ) -> float:
-    """Score a continuation with a minimal DoLa-style contrastive log-prob sum.
+    """Score a continuation with a minimal DoLa-style contrastive log-prob sum."""
+    return score_continuation_dola_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answer=candidate_answer,
+        premature_layer=premature_layer,
+        separator=separator,
+        score_mode=score_mode,
+    ).score
+
+
+
+def score_candidate_answers_dola(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answers: list[str],
+    premature_layer: int,
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> list[tuple[str, float]]:
+    """Score each candidate answer with minimal DoLa-style contrastive scoring."""
+    return [
+        (item.candidate, item.score)
+        for item in score_candidate_answers_dola_with_details(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            candidate_answers=candidate_answers,
+            premature_layer=premature_layer,
+            separator=separator,
+            score_mode=score_mode,
+        )
+    ]
+
+
+
+def score_candidate_answers_dola_with_details(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answers: list[str],
+    premature_layer: int,
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> list[CandidateScore]:
+    """Score each candidate answer with DoLa-style scoring and token counts."""
+    if not candidate_answers:
+        raise ValueError("candidate_answers must contain at least one answer.")
+
+    scored_candidates: list[CandidateScore] = []
+    for candidate_answer in candidate_answers:
+        scored_candidates.append(
+            score_continuation_dola_details(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                candidate_answer=candidate_answer,
+                premature_layer=premature_layer,
+                separator=separator,
+                score_mode=score_mode,
+            )
+        )
+    return scored_candidates
+
+
+
+def score_continuation_dola_details(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answer: str,
+    premature_layer: int,
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+) -> CandidateScore:
+    """Score one candidate with DoLa-style contrastive logits and token counts.
 
     Notes
     -----
@@ -127,6 +268,7 @@ def score_continuation_dola_logprob(
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
     validate_premature_layer(premature_layer, num_hidden_layers)
     mature_layer = get_mature_layer_index(num_hidden_layers)
+    del mature_layer
 
     lm_head = model.get_output_embeddings()
     if lm_head is None:
@@ -150,35 +292,16 @@ def score_continuation_dola_logprob(
         contrastive_logits = mature_logits - premature_logits
         token_log_probs = _gather_token_log_probs(contrastive_logits, input_ids)
 
-    continuation_score = token_log_probs[:, _get_continuation_start_index(prompt_len) :].sum().item()
-    return float(continuation_score)
-
-
-
-def score_candidate_answers_dola(
-    model: Any,
-    tokenizer: Any,
-    prompt: str,
-    candidate_answers: list[str],
-    premature_layer: int,
-    separator: str = " ",
-) -> list[tuple[str, float]]:
-    """Score each candidate answer with minimal DoLa-style contrastive scoring."""
-    if not candidate_answers:
-        raise ValueError("candidate_answers must contain at least one answer.")
-
-    scored_candidates: list[tuple[str, float]] = []
-    for candidate_answer in candidate_answers:
-        score = score_continuation_dola_logprob(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            candidate_answer=candidate_answer,
-            premature_layer=premature_layer,
-            separator=separator,
-        )
-        scored_candidates.append((candidate_answer, score))
-    return scored_candidates
+    continuation_log_probs = token_log_probs[:, _get_continuation_start_index(prompt_len) :]
+    score, continuation_token_count = _aggregate_continuation_log_probs(
+        continuation_log_probs=continuation_log_probs,
+        score_mode=score_mode,
+    )
+    return CandidateScore(
+        candidate=candidate_answer,
+        score=score,
+        continuation_token_count=continuation_token_count,
+    )
 
 
 
@@ -339,6 +462,34 @@ def _gather_token_log_probs(logits: Any, input_ids: Any) -> Any:
     target_ids = input_ids[:, 1:]
     log_probs = torch.log_softmax(logits, dim=-1)
     return log_probs.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+
+
+
+def _aggregate_continuation_log_probs(
+    continuation_log_probs: Any,
+    score_mode: str,
+) -> tuple[float, int]:
+    """Aggregate continuation token log-probs with the requested normalization."""
+    normalized_mode = _normalize_score_mode(score_mode)
+    continuation_token_count = int(continuation_log_probs.shape[-1])
+    if continuation_token_count <= 0:
+        raise ValueError("candidate_answer did not add any continuation tokens.")
+
+    total_logprob = continuation_log_probs.sum().item()
+    if normalized_mode == "sum_logprob":
+        return float(total_logprob), continuation_token_count
+    return float(total_logprob / continuation_token_count), continuation_token_count
+
+
+
+def _normalize_score_mode(score_mode: str) -> str:
+    """Normalize the configurable candidate-scoring aggregation mode."""
+    normalized_mode = score_mode.strip().lower()
+    if normalized_mode not in {"sum_logprob", "mean_logprob"}:
+        raise ValueError(
+            f"Unsupported score_mode '{score_mode}'. Use 'sum_logprob' or 'mean_logprob'."
+        )
+    return normalized_mode
 
 
 

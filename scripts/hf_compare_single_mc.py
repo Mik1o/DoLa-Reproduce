@@ -13,7 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.dola_utils import describe_dola_pair, get_mature_layer_index, validate_premature_layer
-from src.generation import score_candidate_answers, score_candidate_answers_dola
+from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
 from src.metrics import compute_mc_metrics, format_metrics
 from src.modeling import load_model_and_tokenizer
 from src.truthfulqa_mc import build_mc_prompt, get_mc_candidate_sets, load_truthfulqa_samples
@@ -45,6 +45,19 @@ def parse_args() -> argparse.Namespace:
 
 
 
+def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
+    """Convert candidate score objects into JSON-friendly dictionaries."""
+    return [
+        {
+            "candidate": item.candidate,
+            "score": item.score,
+            "continuation_token_count": item.continuation_token_count,
+        }
+        for item in items
+    ]
+
+
+
 def main() -> None:
     """Load one sample, score it twice, and save a compact comparison JSON."""
     args = parse_args()
@@ -59,6 +72,7 @@ def main() -> None:
     sample_index = int(config.get("sample_index", 0))
     premature_layer = int(config["premature_layer"])
     prompt_style = str(config.get("prompt_style", "plain_mc"))
+    score_mode = str(config.get("score_mode", "sum_logprob"))
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
@@ -74,6 +88,7 @@ def main() -> None:
 
     print(f"[hf_compare_single_mc] Model: {model_name}")
     print(f"[hf_compare_single_mc] Device: {device}")
+    print(f"[hf_compare_single_mc] Score mode: {score_mode}")
     print(f"[hf_compare_single_mc] Output directory: {output_dir}")
 
     model, tokenizer = load_model_and_tokenizer(
@@ -87,30 +102,44 @@ def main() -> None:
     mature_layer = get_mature_layer_index(num_hidden_layers)
     pair_description = describe_dola_pair(premature_layer, mature_layer)
 
-    vanilla_true = score_candidate_answers(model, tokenizer, prompt, true_candidates)
-    vanilla_false = score_candidate_answers(model, tokenizer, prompt, false_candidates)
+    vanilla_true = score_candidate_answers_with_details(
+        model,
+        tokenizer,
+        prompt,
+        true_candidates,
+        score_mode=score_mode,
+    )
+    vanilla_false = score_candidate_answers_with_details(
+        model,
+        tokenizer,
+        prompt,
+        false_candidates,
+        score_mode=score_mode,
+    )
     vanilla_metrics = compute_mc_metrics(
-        [score for _, score in vanilla_true],
-        [score for _, score in vanilla_false],
+        [item.score for item in vanilla_true],
+        [item.score for item in vanilla_false],
     )
 
-    dola_true = score_candidate_answers_dola(
+    dola_true = score_candidate_answers_dola_with_details(
         model,
         tokenizer,
         prompt,
         true_candidates,
         premature_layer=premature_layer,
+        score_mode=score_mode,
     )
-    dola_false = score_candidate_answers_dola(
+    dola_false = score_candidate_answers_dola_with_details(
         model,
         tokenizer,
         prompt,
         false_candidates,
         premature_layer=premature_layer,
+        score_mode=score_mode,
     )
     dola_metrics = compute_mc_metrics(
-        [score for _, score in dola_true],
-        [score for _, score in dola_false],
+        [item.score for item in dola_true],
+        [item.score for item in dola_false],
     )
 
     print("[hf_compare_single_mc] Question:")
@@ -125,16 +154,17 @@ def main() -> None:
         "question": sample.question,
         "prompt": prompt,
         "prompt_style": prompt_style,
+        "score_mode": score_mode,
         "premature_layer": premature_layer,
         "mature_layer": mature_layer,
         "vanilla": {
-            "true_scores": [{"candidate": c, "score": s} for c, s in vanilla_true],
-            "false_scores": [{"candidate": c, "score": s} for c, s in vanilla_false],
+            "true_scores": _serialize_candidate_scores(vanilla_true),
+            "false_scores": _serialize_candidate_scores(vanilla_false),
             "metrics": vanilla_metrics,
         },
         "dola": {
-            "true_scores": [{"candidate": c, "score": s} for c, s in dola_true],
-            "false_scores": [{"candidate": c, "score": s} for c, s in dola_false],
+            "true_scores": _serialize_candidate_scores(dola_true),
+            "false_scores": _serialize_candidate_scores(dola_false),
             "metrics": dola_metrics,
         },
     }

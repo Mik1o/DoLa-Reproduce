@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from src.generation import (
+    _aggregate_continuation_log_probs,
     _build_scoring_text_attempts,
     _find_continuation_token_index,
     _prepare_scoring_inputs,
@@ -17,6 +18,23 @@ class _FakeTensor:
 
     def to(self, device: str) -> "_FakeTensor":
         return self
+
+
+class _FakeLogProbTensor:
+    def __init__(self, values: list[float]) -> None:
+        self._values = values
+        self.shape = (1, len(values))
+
+    def sum(self) -> "_FakeScalar":
+        return _FakeScalar(sum(self._values))
+
+
+class _FakeScalar:
+    def __init__(self, value: float) -> None:
+        self._value = value
+
+    def item(self) -> float:
+        return self._value
 
 
 class _FallbackTokenizer:
@@ -144,3 +162,27 @@ def test_prepare_scoring_inputs_raises_after_fallback_failure() -> None:
             candidate_answer="Paris",
             separator=" ",
         )
+
+
+
+def test_aggregate_continuation_log_probs_sum_mode_preserves_old_behavior() -> None:
+    """The default score mode should still use raw summed log-probabilities."""
+    score, token_count = _aggregate_continuation_log_probs(
+        _FakeLogProbTensor([-1.0, -2.0, -3.0]),
+        "sum_logprob",
+    )
+
+    assert score == -6.0
+    assert token_count == 3
+
+
+
+def test_aggregate_continuation_log_probs_mean_mode_normalizes_by_token_count() -> None:
+    """The mean mode should divide by the scored continuation token count."""
+    score, token_count = _aggregate_continuation_log_probs(
+        _FakeLogProbTensor([-1.0, -2.0, -3.0]),
+        "mean_logprob",
+    )
+
+    assert score == -2.0
+    assert token_count == 3
