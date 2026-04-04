@@ -1,0 +1,12 @@
+task_name: "mistral7b_truthfulqa_real_subset"
+model_name: "mistralai/Mistral-7B-v0.1"
+device: "cuda"
+torch_dtype: "float16"
+use_fast_tokenizer: true
+trust_remote_code: false
+attn_implementation: "sdpa"
+prompt_style: "plain_mc"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+max_samples: 5
+premature_layer: 8
+output_dir: "outputs/mistral7b_truthfulqa_real_subset"

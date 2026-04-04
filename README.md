@@ -58,7 +58,8 @@ or the full DoLa paper setup.
 - single-sample vanilla vs DoLa-style comparison,
 - small-subset vanilla vs DoLa-style comparison with saved summaries,
 - configuration-driven switching between tiny-random and TinyLlama,
-- 7B-ready config templates for WSL smoke and compare runs.
+- 7B-ready config templates for WSL smoke and compare runs,
+- a real TruthfulQA.csv small-subset path for 7B compare runs.
 
 ## What Comes Next
 
@@ -225,6 +226,22 @@ python scripts/hf_eval_compare_subset.py --config configs/mistral7b_compare_subs
 For the step-by-step WSL setup order, see `docs/wsl_7b_runbook.md`.
 This is still baseline-prep only: no full TruthfulQA run, no 7B layer sweep,
 and no final formal experiment pipeline yet.
+
+## Real TruthfulQA Small Subset
+
+The current 7B compare path can also point at a real `TruthfulQA.csv` file.
+Recommended order:
+
+1. Preview the real CSV first.
+2. Then run the small subset compare config.
+
+```bash
+python scripts/inspect_truthfulqa_real_csv.py --csv data/truthfulqa/TruthfulQA.csv --limit 3
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset.yaml
+```
+
+This still does **not** do a full TruthfulQA run, a 7B layer sweep, or a
+paper-level final baseline.
 
 ## Premature-Layer Sweep
 

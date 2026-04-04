@@ -23,10 +23,12 @@ SCRIPT_MODULES = [
     "scripts.hf_smoke_test",
     "scripts.hf_sweep_premature_layers",
     "scripts.inspect_truthfulqa_data",
+    "scripts.inspect_truthfulqa_real_csv",
     "scripts.run_tfqa_mc_dola",
     "scripts.run_tfqa_mc_vanilla",
     "scripts.smoke_test",
 ]
+
 
 
 def test_import_core_modules() -> None:

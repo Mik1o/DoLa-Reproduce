@@ -5,17 +5,26 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import pandas as pd
 
 
-QUESTION_FIELDS = ("question", "Question")
-BEST_ANSWER_FIELDS = ("best_answer", "Best Answer")
-CORRECT_ANSWER_FIELDS = ("correct_answers", "Correct Answers")
-INCORRECT_ANSWER_FIELDS = ("incorrect_answers", "Incorrect Answers")
+QUESTION_FIELDS = ("question", "Question", "Question Text")
+BEST_ANSWER_FIELDS = ("best_answer", "Best Answer", "BestAnswer")
+CORRECT_ANSWER_FIELDS = ("correct_answers", "Correct Answers", "CorrectAnswer")
+INCORRECT_ANSWER_FIELDS = (
+    "incorrect_answers",
+    "Incorrect Answers",
+    "IncorrectAnswer",
+)
 CATEGORY_FIELDS = ("category", "Category")
 OPTION_LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_REQUIRED_COLUMN_GROUPS = {
+    "question": QUESTION_FIELDS,
+    "best_answer": BEST_ANSWER_FIELDS,
+    "incorrect_answers": INCORRECT_ANSWER_FIELDS,
+}
 
 
 @dataclass(slots=True)
@@ -40,18 +49,27 @@ class TruthfulQAEvalResult:
     mc3: float
 
 
+
 def load_truthfulqa_csv(csv_path: str | Path) -> pd.DataFrame:
     path = Path(csv_path)
     if not path.is_file():
         raise FileNotFoundError(f"TruthfulQA CSV file not found: {path}")
-    return pd.read_csv(path)
+
+    dataframe = pd.read_csv(path)
+    _validate_required_columns(dataframe.columns)
+    return dataframe
 
 
-def parse_list_field(raw: str | None) -> list[str]:
+
+def parse_list_field(raw: str | None, *, field_name: str = "list field") -> list[str]:
     if _is_missing(raw):
         return []
+    if isinstance(raw, (list, tuple)):
+        return _split_and_clean(raw)
     if not isinstance(raw, str):
-        raise TypeError(f"Expected a string-like list field, but received {type(raw)!r}.")
+        raise TypeError(
+            f"Expected {field_name} to be string-like, but received {type(raw)!r}."
+        )
 
     text = raw.strip()
     if not text:
@@ -61,6 +79,9 @@ def parse_list_field(raw: str | None) -> list[str]:
     if parsed_literal is not None:
         return parsed_literal
 
+    if _looks_like_literal_list(text):
+        raise ValueError(f"Could not parse {field_name} as a list literal: {raw!r}")
+
     for delimiter in (";", "|", "\n"):
         if delimiter in text:
             return _split_and_clean(text.split(delimiter))
@@ -68,11 +89,27 @@ def parse_list_field(raw: str | None) -> list[str]:
     return [text]
 
 
+
 def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
-    question = _get_required_text(row, QUESTION_FIELDS)
-    best_answer = _get_required_text(row, BEST_ANSWER_FIELDS)
-    correct_answers = parse_list_field(_get_optional_value(row, CORRECT_ANSWER_FIELDS))
-    incorrect_answers = parse_list_field(_get_optional_value(row, INCORRECT_ANSWER_FIELDS))
+    question = _get_required_text(row, QUESTION_FIELDS, field_label="question")
+    best_answer = _get_required_text(row, BEST_ANSWER_FIELDS, field_label="best_answer")
+
+    try:
+        correct_answers = parse_list_field(
+            _get_optional_value(row, CORRECT_ANSWER_FIELDS),
+            field_name="correct_answers",
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Row {row.name!r} has invalid correct_answers: {error}") from error
+
+    try:
+        incorrect_answers = parse_list_field(
+            _get_optional_value(row, INCORRECT_ANSWER_FIELDS),
+            field_name="incorrect_answers",
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"Row {row.name!r} has invalid incorrect_answers: {error}") from error
+
     category = _get_optional_text(row, CATEGORY_FIELDS)
 
     if not correct_answers:
@@ -82,7 +119,8 @@ def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
 
     if not incorrect_answers:
         raise ValueError(
-            f"Row {row.name!r} is missing incorrect answers required for MC prompts."
+            f"Row {row.name!r} has empty incorrect_answers after parsing; "
+            "multiple-choice prompts require at least one false answer."
         )
 
     return TruthfulQASample(
@@ -94,15 +132,18 @@ def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
     )
 
 
+
 def load_truthfulqa_samples(csv_path: str | Path) -> list[TruthfulQASample]:
     dataframe = load_truthfulqa_csv(csv_path)
     return [normalize_truthfulqa_row(row) for _, row in dataframe.iterrows()]
+
 
 
 def get_mc_candidate_sets(sample: TruthfulQASample) -> tuple[list[str], list[str]]:
     true_candidates = _dedupe_preserve_order([sample.best_answer, *sample.correct_answers])
     false_candidates = _dedupe_preserve_order(sample.incorrect_answers)
     return true_candidates, false_candidates
+
 
 
 def build_mc_prompt(sample: TruthfulQASample, prompt_style: str = "plain_mc") -> str:
@@ -121,6 +162,7 @@ def build_mc_prompt(sample: TruthfulQASample, prompt_style: str = "plain_mc") ->
     )
 
 
+
 def _build_plain_mc_prompt(sample: TruthfulQASample) -> str:
     options = _dedupe_preserve_order([sample.best_answer, *sample.incorrect_answers])
     if len(options) > len(OPTION_LABELS):
@@ -137,18 +179,43 @@ def _build_plain_mc_prompt(sample: TruthfulQASample) -> str:
     return "\n".join(lines)
 
 
-def _get_required_text(row: pd.Series, field_names: tuple[str, ...]) -> str:
+
+def _validate_required_columns(columns: Iterable[object]) -> None:
+    normalized_columns = {_normalize_field_name(str(column)) for column in columns}
+    missing_labels = [
+        field_label
+        for field_label, aliases in _REQUIRED_COLUMN_GROUPS.items()
+        if not any(_normalize_field_name(alias) in normalized_columns for alias in aliases)
+    ]
+    if missing_labels:
+        raise ValueError(
+            "TruthfulQA CSV is missing required column groups: "
+            f"{', '.join(missing_labels)}. "
+            f"Available columns: {', '.join(str(column) for column in columns)}"
+        )
+
+
+
+def _get_required_text(
+    row: pd.Series,
+    field_names: tuple[str, ...],
+    *,
+    field_label: str,
+) -> str:
     value = _get_optional_value(row, field_names)
     if _is_missing(value):
-        field_list = ", ".join(field_names)
-        raise ValueError(f"Row {row.name!r} is missing required field(s): {field_list}")
+        alias_list = ", ".join(field_names)
+        raise ValueError(
+            f"Row {row.name!r} is missing required field '{field_label}'. "
+            f"Accepted column names: {alias_list}"
+        )
     if not isinstance(value, str):
         value = str(value)
     text = value.strip()
     if not text:
-        field_list = ", ".join(field_names)
-        raise ValueError(f"Row {row.name!r} has an empty required field: {field_list}")
+        raise ValueError(f"Row {row.name!r} has an empty required field '{field_label}'.")
     return text
+
 
 
 def _get_optional_text(row: pd.Series, field_names: tuple[str, ...]) -> str | None:
@@ -161,19 +228,32 @@ def _get_optional_text(row: pd.Series, field_names: tuple[str, ...]) -> str | No
     return text or None
 
 
+
 def _get_optional_value(row: pd.Series, field_names: tuple[str, ...]) -> Any:
-    for field_name in field_names:
-        if field_name in row.index:
-            return row[field_name]
+    matching_column = _find_matching_column(row.index, field_names)
+    if matching_column is None:
+        return None
+    return row[matching_column]
+
+
+
+def _find_matching_column(columns: Iterable[object], field_names: tuple[str, ...]) -> str | None:
+    normalized_aliases = {_normalize_field_name(field_name) for field_name in field_names}
+    for column in columns:
+        column_name = str(column)
+        if _normalize_field_name(column_name) in normalized_aliases:
+            return column_name
     return None
 
 
+
+def _normalize_field_name(field_name: str) -> str:
+    return "".join(character.lower() for character in field_name if character.isalnum())
+
+
+
 def _parse_literal_list(text: str) -> list[str] | None:
-    is_literal = (
-        (text.startswith("[") and text.endswith("]"))
-        or (text.startswith("(") and text.endswith(")"))
-    )
-    if not is_literal:
+    if not _looks_like_literal_list(text):
         return None
 
     try:
@@ -188,6 +268,17 @@ def _parse_literal_list(text: str) -> list[str] | None:
     return None
 
 
+
+def _looks_like_literal_list(text: str) -> bool:
+    return (
+        (text.startswith("[") and text.endswith("]"))
+        or (text.startswith("(") and text.endswith(")"))
+        or text.startswith("[")
+        or text.startswith("(")
+    )
+
+
+
 def _split_and_clean(items: Any) -> list[str]:
     cleaned: list[str] = []
     for item in items:
@@ -195,6 +286,7 @@ def _split_and_clean(items: Any) -> list[str]:
         if text:
             cleaned.append(text)
     return cleaned
+
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -205,6 +297,7 @@ def _dedupe_preserve_order(items: list[str]) -> list[str]:
             seen.add(item)
             deduped.append(item)
     return deduped
+
 
 
 def _is_missing(value: object) -> bool:
