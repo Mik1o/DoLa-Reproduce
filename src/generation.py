@@ -217,6 +217,16 @@ def _prepare_scoring_inputs(
     attempts = _build_scoring_text_attempts(prompt, cleaned_candidate, separator)
 
     for prompt_text, full_text in attempts:
+        offset_result = _prepare_scoring_inputs_with_offsets(
+            model=model,
+            tokenizer=tokenizer,
+            prompt_text=prompt_text,
+            full_text=full_text,
+        )
+        if offset_result is not None:
+            return offset_result
+
+    for prompt_text, full_text in attempts:
         prompt_batch = tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
         full_batch = tokenizer(full_text, return_tensors="pt", add_special_tokens=False)
 
@@ -255,6 +265,64 @@ def _build_scoring_text_attempts(
             seen.add(pair)
             attempts.append(pair)
     return attempts
+
+
+
+def _prepare_scoring_inputs_with_offsets(
+    model: Any,
+    tokenizer: Any,
+    prompt_text: str,
+    full_text: str,
+) -> tuple[str, Any, Any, int] | None:
+    """Use offset mapping to locate the continuation start when available."""
+    try:
+        full_batch = tokenizer(
+            full_text,
+            return_tensors="pt",
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+    except (NotImplementedError, TypeError, ValueError):
+        return None
+
+    offset_mapping = full_batch.get("offset_mapping")
+    if offset_mapping is None:
+        return None
+
+    continuation_token_index = _find_continuation_token_index(
+        offset_mapping=offset_mapping[0],
+        prompt_char_len=len(prompt_text),
+    )
+    if continuation_token_index is None:
+        return None
+
+    input_ids = full_batch["input_ids"].to(model.device)
+    attention_mask = full_batch["attention_mask"].to(model.device)
+    return prompt_text, input_ids, attention_mask, continuation_token_index
+
+
+
+def _find_continuation_token_index(
+    offset_mapping: Any,
+    prompt_char_len: int,
+) -> int | None:
+    """Find the first token whose character span reaches into the candidate text."""
+    for token_index, offset_pair in enumerate(offset_mapping):
+        start_offset, end_offset = _coerce_offset_pair(offset_pair)
+        if start_offset == end_offset == 0:
+            continue
+        if end_offset > prompt_char_len:
+            return token_index
+    return None
+
+
+
+def _coerce_offset_pair(offset_pair: Any) -> tuple[int, int]:
+    """Normalize one tokenizer offset pair to plain Python integers."""
+    if len(offset_pair) != 2:
+        raise ValueError(f"Invalid offset pair: {offset_pair!r}")
+    start_offset, end_offset = offset_pair
+    return int(start_offset), int(end_offset)
 
 
 
