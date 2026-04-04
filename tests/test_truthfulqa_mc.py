@@ -61,15 +61,28 @@ def test_load_truthfulqa_samples_accepts_realistic_column_variants() -> None:
 
 
 
-def test_build_mc_prompt_contains_question_and_options() -> None:
-    """Prompt construction should include the question and labeled options."""
+def test_build_mc_prompt_options_mode_keeps_existing_behavior() -> None:
+    """The options-style prompt should still expose the full answer list."""
     sample = load_truthfulqa_samples(FIXTURE_CSV)[0]
-    prompt = build_mc_prompt(sample)
+    prompt = build_mc_prompt(sample, prompt_style="options_mc")
 
     assert "Question: What is the capital of France?" in prompt
     assert "A. Paris" in prompt
     assert "B. London" in prompt
     assert prompt.rstrip().endswith("Answer:")
+
+
+
+def test_build_mc_prompt_direct_mode_hides_candidates() -> None:
+    """The direct-answer prompt should not expose answer choices in advance."""
+    sample = load_truthfulqa_samples(FIXTURE_CSV)[0]
+    prompt = build_mc_prompt(sample, prompt_style="direct_answer_mc")
+
+    assert "Question: What is the capital of France?" in prompt
+    assert "Answer:" in prompt
+    assert "Paris" not in prompt
+    assert "London" not in prompt
+    assert "Options:" not in prompt
 
 
 

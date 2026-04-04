@@ -32,6 +32,12 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="Number of normalized samples to preview.",
     )
+    parser.add_argument(
+        "--prompt-style",
+        type=str,
+        default="options_mc",
+        help="Prompt style to preview: options_mc or direct_answer_mc.",
+    )
     return parser.parse_args()
 
 
@@ -46,12 +52,13 @@ def main() -> None:
     preview_rows = min(len(dataframe), args.limit)
 
     print(f"[inspect_truthfulqa_real_csv] CSV: {args.csv}")
+    print(f"[inspect_truthfulqa_real_csv] Prompt style: {args.prompt_style}")
     print(f"[inspect_truthfulqa_real_csv] Total rows: {len(dataframe)}")
     print(f"[inspect_truthfulqa_real_csv] Previewing first {preview_rows} rows")
 
     for row_index, (_, row) in enumerate(dataframe.head(args.limit).iterrows(), start=1):
         sample = normalize_truthfulqa_row(row)
-        prompt = build_mc_prompt(sample)
+        prompt = build_mc_prompt(sample, prompt_style=args.prompt_style)
         print(f"\n[{row_index}] question: {sample.question}")
         print(f"best_answer: {sample.best_answer}")
         print(f"correct_answers: {len(sample.correct_answers)}")

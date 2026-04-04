@@ -59,7 +59,8 @@ or the full DoLa paper setup.
 - small-subset vanilla vs DoLa-style comparison with saved summaries,
 - configuration-driven switching between tiny-random and TinyLlama,
 - 7B-ready config templates for WSL smoke and compare runs,
-- a real TruthfulQA.csv small-subset path for 7B compare runs.
+- a real TruthfulQA.csv small-subset path for 7B compare runs,
+- two TruthfulQA prompt modes: `options_mc` and `direct_answer_mc`.
 
 ## What Comes Next
 
@@ -199,6 +200,16 @@ Run it with:
 python scripts/hf_eval_compare_subset.py --config configs/hf_tiny_compare_subset.yaml
 ```
 
+## TruthfulQA Prompt Modes
+
+The project now supports two TruthfulQA scoring prompt modes:
+
+- `options_mc`: exposes the candidate list in the prompt before scoring.
+- `direct_answer_mc`: only shows the question plus a short answer cue, which is closer to the baseline reproduction setting.
+
+For baseline-focused reproduction work, prefer trying `direct_answer_mc` first.
+This still does **not** run the full TruthfulQA benchmark or any layer sweep.
+
 ## TinyLlama Configs
 
 In addition to the tiny-random fallback configs, the project now includes a
@@ -236,8 +247,8 @@ Recommended order:
 2. Then run the small subset compare config.
 
 ```bash
-python scripts/inspect_truthfulqa_real_csv.py --csv data/truthfulqa/TruthfulQA.csv --limit 3
-python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset.yaml
+python scripts/inspect_truthfulqa_real_csv.py --csv data/truthfulqa/TruthfulQA.csv --limit 3 --prompt-style direct_answer_mc
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_direct.yaml
 ```
 
 This still does **not** do a full TruthfulQA run, a 7B layer sweep, or a
