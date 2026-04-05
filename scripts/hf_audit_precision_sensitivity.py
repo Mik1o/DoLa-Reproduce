@@ -166,7 +166,12 @@ def _recompute_bucket_for_dtype(
     relative_top: float,
     relative_top_value: float,
 ) -> dict[str, object]:
-    candidate_stack = type(mature_logits).stack(
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError("torch is required for precision sensitivity auditing.") from error
+
+    candidate_stack = torch.stack(
         [candidate_logits_map[layer].to(dtype=recompute_dtype) for layer in candidate_layers],
         dim=0,
     )
