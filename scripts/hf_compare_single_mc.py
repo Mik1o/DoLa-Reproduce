@@ -12,7 +12,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.dola_utils import describe_dola_pair, get_mature_layer_index, validate_premature_layer
+from src.dola_utils import (
+    describe_dola_pair,
+    get_mature_layer_index,
+    validate_candidate_premature_layers,
+    validate_mature_layer,
+)
 from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
 from src.metrics import compute_mc_metrics, format_metrics
 from src.modeling import load_model_and_tokenizer
@@ -45,6 +50,14 @@ def parse_args() -> argparse.Namespace:
 
 
 
+def _serialize_layer_dist(layer_dist: dict[int, int] | None) -> dict[str, int] | None:
+    """Convert an integer-keyed layer-usage mapping into JSON-friendly keys."""
+    if not layer_dist:
+        return None
+    return {str(layer): count for layer, count in sorted(layer_dist.items())}
+
+
+
 def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
     """Convert candidate score objects into JSON-friendly dictionaries."""
     return [
@@ -52,9 +65,23 @@ def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
             "candidate": item.candidate,
             "score": item.score,
             "continuation_token_count": item.continuation_token_count,
+            "premature_layer_dist": _serialize_layer_dist(item.premature_layer_dist),
         }
         for item in items
     ]
+
+
+
+def _aggregate_layer_usage(items: list[object]) -> dict[int, int] | None:
+    """Aggregate per-candidate dynamic layer usage counts into one summary."""
+    aggregate: dict[int, int] = {}
+    for item in items:
+        layer_dist = getattr(item, "premature_layer_dist", None)
+        if not layer_dist:
+            continue
+        for layer, count in layer_dist.items():
+            aggregate[int(layer)] = aggregate.get(int(layer), 0) + int(count)
+    return aggregate or None
 
 
 
@@ -70,13 +97,16 @@ def main() -> None:
     device = config.get("device", "cpu")
     csv_path = Path(str(config["csv_path"]))
     sample_index = int(config.get("sample_index", 0))
-    premature_layer = int(config["premature_layer"])
+    premature_layer = int(config.get("premature_layer", 0))
     prompt_style = str(config.get("prompt_style", "plain_mc"))
     score_mode = str(config.get("score_mode", "sum_logprob"))
     dola_score_mode = str(config.get("dola_score_mode", "legacy_contrastive"))
     post_softmax = bool(config.get("post_softmax", False))
     relative_top = float(config.get("relative_top", 0.0))
     relative_top_value = float(config.get("relative_top_value", -1000.0))
+    candidate_premature_layers = [int(layer) for layer in config.get("candidate_premature_layers", [])]
+    mature_layer = config.get("mature_layer")
+    mature_layer = None if mature_layer is None else int(mature_layer)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
@@ -103,9 +133,25 @@ def main() -> None:
     )
 
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
-    validate_premature_layer(premature_layer, num_hidden_layers)
-    mature_layer = get_mature_layer_index(num_hidden_layers)
-    pair_description = describe_dola_pair(premature_layer, mature_layer)
+    resolved_mature_layer = get_mature_layer_index(num_hidden_layers)
+    if mature_layer is not None:
+        validate_mature_layer(mature_layer, num_hidden_layers)
+        resolved_mature_layer = mature_layer
+
+    if dola_score_mode == "official_dynamic_dola":
+        resolved_candidate_layers = validate_candidate_premature_layers(
+            candidate_premature_layers,
+            resolved_mature_layer,
+            num_hidden_layers,
+        )
+        pair_description = (
+            f"candidate_premature_layers={resolved_candidate_layers}, "
+            f"mature_layer={resolved_mature_layer}"
+        )
+    else:
+        resolved_candidate_layers = []
+        validate_candidate_premature_layers([premature_layer], resolved_mature_layer, num_hidden_layers)
+        pair_description = describe_dola_pair(premature_layer, resolved_mature_layer)
 
     vanilla_true = score_candidate_answers_with_details(
         model,
@@ -137,6 +183,8 @@ def main() -> None:
         post_softmax=post_softmax,
         relative_top=relative_top,
         relative_top_value=relative_top_value,
+        candidate_premature_layers=resolved_candidate_layers,
+        mature_layer=resolved_mature_layer,
     )
     dola_false = score_candidate_answers_dola_with_details(
         model,
@@ -149,11 +197,14 @@ def main() -> None:
         post_softmax=post_softmax,
         relative_top=relative_top,
         relative_top_value=relative_top_value,
+        candidate_premature_layers=resolved_candidate_layers,
+        mature_layer=resolved_mature_layer,
     )
     dola_metrics = compute_mc_metrics(
         [item.score for item in dola_true],
         [item.score for item in dola_false],
     )
+    aggregate_premature_layer_dist = _aggregate_layer_usage(dola_true + dola_false)
 
     print("[hf_compare_single_mc] Question:")
     print(sample.question)
@@ -162,6 +213,11 @@ def main() -> None:
     print(f"[hf_compare_single_mc] DoLa pair: {pair_description}")
     print(f"[hf_compare_single_mc] Vanilla metrics: {format_metrics(vanilla_metrics)}")
     print(f"[hf_compare_single_mc] DoLa metrics: {format_metrics(dola_metrics)}")
+    if aggregate_premature_layer_dist:
+        print(
+            "[hf_compare_single_mc] premature_layer_dist: "
+            f"{_serialize_layer_dist(aggregate_premature_layer_dist)}"
+        )
 
     result = {
         "question": sample.question,
@@ -173,7 +229,8 @@ def main() -> None:
         "relative_top": relative_top,
         "relative_top_value": relative_top_value,
         "premature_layer": premature_layer,
-        "mature_layer": mature_layer,
+        "candidate_premature_layers": resolved_candidate_layers or None,
+        "mature_layer": resolved_mature_layer,
         "vanilla": {
             "true_scores": _serialize_candidate_scores(vanilla_true),
             "false_scores": _serialize_candidate_scores(vanilla_false),
@@ -183,6 +240,7 @@ def main() -> None:
             "true_scores": _serialize_candidate_scores(dola_true),
             "false_scores": _serialize_candidate_scores(dola_false),
             "metrics": dola_metrics,
+            "premature_layer_dist": _serialize_layer_dist(aggregate_premature_layer_dist),
         },
     }
 

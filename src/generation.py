@@ -6,7 +6,11 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from src.dola_utils import get_mature_layer_index, validate_premature_layer
+from src.dola_utils import (
+    get_mature_layer_index,
+    validate_candidate_premature_layers,
+    validate_mature_layer,
+)
 
 
 @dataclass(slots=True)
@@ -14,6 +18,7 @@ class CandidateScore:
     candidate: str
     score: float
     continuation_token_count: int
+    premature_layer_dist: dict[int, int] | None = None
 
 
 
@@ -162,6 +167,8 @@ def score_continuation_dola_logprob(
     post_softmax: bool = False,
     relative_top: float = 0.0,
     relative_top_value: float = -1000.0,
+    candidate_premature_layers: list[int] | None = None,
+    mature_layer: int | None = None,
 ) -> float:
     """Score a continuation with configurable DoLa-style scoring."""
     return score_continuation_dola_details(
@@ -176,6 +183,8 @@ def score_continuation_dola_logprob(
         post_softmax=post_softmax,
         relative_top=relative_top,
         relative_top_value=relative_top_value,
+        candidate_premature_layers=candidate_premature_layers,
+        mature_layer=mature_layer,
     ).score
 
 
@@ -192,6 +201,8 @@ def score_candidate_answers_dola(
     post_softmax: bool = False,
     relative_top: float = 0.0,
     relative_top_value: float = -1000.0,
+    candidate_premature_layers: list[int] | None = None,
+    mature_layer: int | None = None,
 ) -> list[tuple[str, float]]:
     """Score each candidate answer with configurable DoLa-style scoring."""
     return [
@@ -208,6 +219,8 @@ def score_candidate_answers_dola(
             post_softmax=post_softmax,
             relative_top=relative_top,
             relative_top_value=relative_top_value,
+            candidate_premature_layers=candidate_premature_layers,
+            mature_layer=mature_layer,
         )
     ]
 
@@ -225,6 +238,8 @@ def score_candidate_answers_dola_with_details(
     post_softmax: bool = False,
     relative_top: float = 0.0,
     relative_top_value: float = -1000.0,
+    candidate_premature_layers: list[int] | None = None,
+    mature_layer: int | None = None,
 ) -> list[CandidateScore]:
     """Score each candidate answer with DoLa-style scoring and token counts."""
     if not candidate_answers:
@@ -243,6 +258,8 @@ def score_candidate_answers_dola_with_details(
             post_softmax=post_softmax,
             relative_top=relative_top,
             relative_top_value=relative_top_value,
+            candidate_premature_layers=candidate_premature_layers,
+            mature_layer=mature_layer,
         )
         for candidate_answer in candidate_answers
     ]
@@ -261,6 +278,8 @@ def score_continuation_dola_details(
     post_softmax: bool = False,
     relative_top: float = 0.0,
     relative_top_value: float = -1000.0,
+    candidate_premature_layers: list[int] | None = None,
+    mature_layer: int | None = None,
 ) -> CandidateScore:
     """Score one candidate with configurable DoLa-style scoring and token counts.
 
@@ -268,7 +287,6 @@ def score_continuation_dola_details(
     -----
     For decoder-only models, ``hidden_states[0]`` is the embedding output and
     ``hidden_states[k + 1]`` corresponds to the output of decoder block ``k``.
-    The mature representation is taken from ``hidden_states[-1]``.
     """
     try:
         import torch
@@ -287,13 +305,27 @@ def score_continuation_dola_details(
     )
 
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
-    validate_premature_layer(premature_layer, num_hidden_layers)
+    resolved_mature_layer = _resolve_mature_layer(mature_layer, num_hidden_layers)
+    normalized_dola_mode = _normalize_dola_score_mode(dola_score_mode)
+    resolved_premature_layer: int | None = None
+    resolved_candidate_layers: list[int] = []
+
+    if normalized_dola_mode in {"legacy_contrastive", "official_static_dola"}:
+        resolved_premature_layer = validate_candidate_premature_layers(
+            [premature_layer],
+            resolved_mature_layer,
+            num_hidden_layers,
+        )[0]
+    else:
+        resolved_candidate_layers = validate_candidate_premature_layers(
+            candidate_premature_layers,
+            resolved_mature_layer,
+            num_hidden_layers,
+        )
 
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise ValueError("The model does not expose output embeddings for DoLa-style scoring.")
-
-    normalized_dola_mode = _normalize_dola_score_mode(dola_score_mode)
 
     with torch.no_grad():
         outputs = model(
@@ -305,34 +337,61 @@ def score_continuation_dola_details(
         if hidden_states is None:
             raise ValueError("The model did not return hidden_states for DoLa-style scoring.")
 
-        mature_hidden = hidden_states[-1]
-        premature_hidden = hidden_states[premature_layer + 1]
+        mature_hidden = hidden_states[resolved_mature_layer + 1]
         mature_logits = lm_head(mature_hidden[:, :-1, :])
-        premature_logits = lm_head(premature_hidden[:, :-1, :])
 
         if normalized_dola_mode == "legacy_contrastive":
+            premature_hidden = hidden_states[resolved_premature_layer + 1]
+            premature_logits = lm_head(premature_hidden[:, :-1, :])
             token_scores = _gather_token_log_probs(mature_logits - premature_logits, input_ids)
+            selected_layers: list[int] = [resolved_premature_layer] * int(mature_logits.shape[1])
+        elif normalized_dola_mode == "official_static_dola":
+            premature_hidden = hidden_states[resolved_premature_layer + 1]
+            premature_logits = lm_head(premature_hidden[:, :-1, :])
+            token_scores = _compute_official_dola_token_scores(
+                mature_logits=mature_logits,
+                base_logits=premature_logits,
+                input_ids=input_ids,
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+            )
+            selected_layers = [resolved_premature_layer] * int(mature_logits.shape[1])
         else:
-            final_log_probs = torch.log_softmax(mature_logits, dim=-1)
-            base_log_probs = torch.log_softmax(premature_logits, dim=-1)
-            diff_logits = final_log_probs - base_log_probs
-            if post_softmax:
-                diff_logits = torch.log_softmax(diff_logits, dim=-1)
-            if relative_top > 0.0:
-                diff_logits = _apply_relative_top_mask(
-                    diff_logits=diff_logits,
-                    final_log_probs=final_log_probs,
-                    relative_top=relative_top,
-                    relative_top_value=relative_top_value,
-                )
-            token_scores = _gather_scores_at_target_ids(diff_logits, input_ids)
+            candidate_logits = torch.stack(
+                [lm_head(hidden_states[layer + 1][:, :-1, :]) for layer in resolved_candidate_layers],
+                dim=0,
+            )
+            base_logits, selected_layers = _select_dynamic_base_logits(
+                mature_logits=mature_logits,
+                candidate_logits=candidate_logits,
+                candidate_layers=resolved_candidate_layers,
+            )
+            token_scores = _compute_official_dola_token_scores(
+                mature_logits=mature_logits,
+                base_logits=base_logits,
+                input_ids=input_ids,
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+            )
 
-    continuation_scores = token_scores[:, _get_continuation_start_index(prompt_len) :]
+    continuation_start = _get_continuation_start_index(prompt_len)
+    continuation_scores = token_scores[:, continuation_start:]
     score, continuation_token_count = _aggregate_continuation_log_probs(
         continuation_log_probs=continuation_scores,
         score_mode=score_mode,
     )
-    return CandidateScore(candidate=candidate_answer, score=score, continuation_token_count=continuation_token_count)
+    premature_layer_dist = _count_premature_layer_usage(
+        selected_layers[continuation_start:],
+        resolved_candidate_layers if resolved_candidate_layers else [resolved_premature_layer],
+    )
+    return CandidateScore(
+        candidate=candidate_answer,
+        score=score,
+        continuation_token_count=continuation_token_count,
+        premature_layer_dist=premature_layer_dist or None,
+    )
 
 
 
@@ -514,6 +573,97 @@ def _gather_scores_at_target_ids(scores: Any, input_ids: Any) -> Any:
 
 
 
+def _compute_official_dola_token_scores(
+    mature_logits: Any,
+    base_logits: Any,
+    input_ids: Any,
+    post_softmax: bool,
+    relative_top: float,
+    relative_top_value: float,
+) -> Any:
+    """Apply official-style static contrastive scoring once base logits are chosen."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    final_log_probs = torch.log_softmax(mature_logits, dim=-1)
+    base_log_probs = torch.log_softmax(base_logits, dim=-1)
+    diff_logits = final_log_probs - base_log_probs
+    if post_softmax:
+        diff_logits = torch.log_softmax(diff_logits, dim=-1)
+    if relative_top > 0.0:
+        diff_logits = _apply_relative_top_mask(
+            diff_logits=diff_logits,
+            final_log_probs=final_log_probs,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+        )
+    return _gather_scores_at_target_ids(diff_logits, input_ids)
+
+
+
+def _select_dynamic_base_logits(
+    mature_logits: Any,
+    candidate_logits: Any,
+    candidate_layers: list[int],
+) -> tuple[Any, list[int]]:
+    """Pick one premature layer per token position via JS divergence."""
+    try:
+        import torch
+        import torch.nn.functional as F
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    if mature_logits.shape[0] != 1:
+        raise ValueError("official_dynamic_dola currently expects batch size 1 scoring.")
+
+    mature_probs = torch.softmax(mature_logits, dim=-1)
+    mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+    candidate_probs = torch.softmax(candidate_logits, dim=-1)
+    candidate_log_probs = torch.log_softmax(candidate_logits, dim=-1)
+
+    mixture = 0.5 * (mature_probs.unsqueeze(0) + candidate_probs)
+    kl_mature = F.kl_div(
+        mature_log_probs.unsqueeze(0).expand_as(candidate_log_probs),
+        mixture,
+        reduction="none",
+    ).mean(dim=-1)
+    kl_candidate = F.kl_div(
+        candidate_log_probs,
+        mixture,
+        reduction="none",
+    ).mean(dim=-1)
+    js_divergence = 0.5 * (kl_mature + kl_candidate)
+    selected_indices = js_divergence.mean(dim=1).argmax(dim=0)
+
+    seq_len = int(mature_logits.shape[1])
+    token_positions = torch.arange(seq_len, device=mature_logits.device)
+    candidate_logits_single = candidate_logits[:, 0, :, :].permute(1, 0, 2)
+    base_logits = candidate_logits_single[token_positions, selected_indices].unsqueeze(0)
+    selected_layers = [candidate_layers[int(index)] for index in selected_indices.tolist()]
+    return base_logits, selected_layers
+
+
+
+def _count_premature_layer_usage(
+    selected_layers: list[int],
+    candidate_layers: list[int],
+) -> dict[int, int]:
+    """Count how many scored continuation tokens chose each candidate layer."""
+    usage = {int(layer): 0 for layer in candidate_layers if layer is not None}
+    for layer in selected_layers:
+        usage[int(layer)] = usage.get(int(layer), 0) + 1
+    return {layer: count for layer, count in usage.items() if count > 0}
+
+
+
 def _aggregate_continuation_log_probs(
     continuation_log_probs: Any,
     score_mode: str,
@@ -545,10 +695,14 @@ def _normalize_score_mode(score_mode: str) -> str:
 def _normalize_dola_score_mode(dola_score_mode: str) -> str:
     """Normalize the DoLa scoring rule used for candidate comparison."""
     normalized_mode = dola_score_mode.strip().lower()
-    if normalized_mode not in {"legacy_contrastive", "official_static_dola"}:
+    if normalized_mode not in {
+        "legacy_contrastive",
+        "official_static_dola",
+        "official_dynamic_dola",
+    }:
         raise ValueError(
             "Unsupported dola_score_mode "
-            f"'{dola_score_mode}'. Use 'legacy_contrastive' or 'official_static_dola'."
+            f"'{dola_score_mode}'. Use 'legacy_contrastive', 'official_static_dola', or 'official_dynamic_dola'."
         )
     return normalized_mode
 
@@ -576,6 +730,15 @@ def _apply_relative_top_mask(
     threshold = max_log_probs + math.log(relative_top)
     mask = final_log_probs < threshold
     return torch.where(mask, torch.full_like(diff_logits, relative_top_value), diff_logits)
+
+
+
+def _resolve_mature_layer(mature_layer: int | None, num_hidden_layers: int) -> int:
+    """Resolve the mature layer index from config or default final layer."""
+    if mature_layer is None:
+        return get_mature_layer_index(num_hidden_layers)
+    validate_mature_layer(mature_layer, num_hidden_layers)
+    return mature_layer
 
 
 

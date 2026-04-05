@@ -18,6 +18,45 @@ def validate_premature_layer(premature_layer: int, num_hidden_layers: int) -> No
 
 
 
+def validate_mature_layer(mature_layer: int, num_hidden_layers: int) -> None:
+    """Validate a zero-based mature layer index."""
+    if num_hidden_layers <= 0:
+        raise ValueError("num_hidden_layers must be positive.")
+    if mature_layer < 0:
+        raise ValueError("mature_layer must be a non-negative integer.")
+    if mature_layer >= num_hidden_layers:
+        raise ValueError(
+            f"mature_layer must be smaller than num_hidden_layers ({num_hidden_layers})."
+        )
+
+
+
+def validate_candidate_premature_layers(
+    candidate_premature_layers: list[int] | None,
+    mature_layer: int,
+    num_hidden_layers: int,
+) -> list[int]:
+    """Validate and normalize candidate premature layers for dynamic DoLa scoring."""
+    validate_mature_layer(mature_layer, num_hidden_layers)
+    if not candidate_premature_layers:
+        raise ValueError("candidate_premature_layers must contain at least one layer index.")
+
+    normalized_layers = sorted(set(int(layer) for layer in candidate_premature_layers))
+    if len(normalized_layers) != len(candidate_premature_layers):
+        raise ValueError("candidate_premature_layers must not contain duplicate layers.")
+    if any(layer < 0 for layer in normalized_layers):
+        raise ValueError("candidate_premature_layers must contain non-negative integers.")
+    if any(layer >= num_hidden_layers for layer in normalized_layers):
+        raise ValueError(
+            "candidate_premature_layers must be smaller than num_hidden_layers "
+            f"({num_hidden_layers})."
+        )
+    if any(layer >= mature_layer for layer in normalized_layers):
+        raise ValueError("Every candidate premature layer must be smaller than mature_layer.")
+    return normalized_layers
+
+
+
 def get_mature_layer_index(num_hidden_layers: int) -> int:
     """Return the zero-based mature layer index for the model's final layer."""
     if num_hidden_layers <= 0:

@@ -7,6 +7,7 @@ import pytest
 from src.generation import (
     _aggregate_continuation_log_probs,
     _build_scoring_text_attempts,
+    _count_premature_layer_usage,
     _find_continuation_token_index,
     _normalize_dola_score_mode,
     _prepare_scoring_inputs,
@@ -198,6 +199,15 @@ def test_aggregate_continuation_log_probs_mean_mode_normalizes_by_token_count() 
 
 
 
-def test_normalize_dola_score_mode_accepts_official_static_dola() -> None:
-    """The new official-aligned DoLa score mode should be recognized."""
-    assert _normalize_dola_score_mode('official_static_dola') == 'official_static_dola'
+def test_count_premature_layer_usage_returns_selected_layer_counts() -> None:
+    """Dynamic DoLa should expose how often each candidate premature layer was chosen."""
+    usage = _count_premature_layer_usage([15, 17, 15, 29], [15, 17, 29])
+
+    assert usage == {15: 2, 17: 1, 29: 1}
+
+
+
+def test_normalize_dola_score_mode_accepts_official_modes() -> None:
+    """Official-aligned DoLa score modes should be recognized."""
+    assert _normalize_dola_score_mode("official_static_dola") == "official_static_dola"
+    assert _normalize_dola_score_mode("official_dynamic_dola") == "official_dynamic_dola"

@@ -13,7 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.dola_utils import describe_dola_pair, get_mature_layer_index, validate_premature_layer
+from src.dola_utils import (
+    describe_dola_pair,
+    get_mature_layer_index,
+    validate_candidate_premature_layers,
+    validate_mature_layer,
+)
 from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
 from src.metrics import (
     aggregate_mc_metrics,
@@ -51,6 +56,14 @@ def parse_args() -> argparse.Namespace:
 
 
 
+def _serialize_layer_dist(layer_dist: dict[int, int] | None) -> dict[str, int] | None:
+    """Convert an integer-keyed layer-usage mapping into JSON-friendly keys."""
+    if not layer_dist:
+        return None
+    return {str(layer): count for layer, count in sorted(layer_dist.items())}
+
+
+
 def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
     """Convert candidate score objects into JSON-friendly dictionaries."""
     return [
@@ -58,9 +71,23 @@ def _serialize_candidate_scores(items: list[object]) -> list[dict[str, object]]:
             "candidate": item.candidate,
             "score": item.score,
             "continuation_token_count": item.continuation_token_count,
+            "premature_layer_dist": _serialize_layer_dist(item.premature_layer_dist),
         }
         for item in items
     ]
+
+
+
+def _aggregate_layer_usage(items: list[object]) -> dict[int, int] | None:
+    """Aggregate per-candidate dynamic layer usage counts into one summary."""
+    aggregate: dict[int, int] = {}
+    for item in items:
+        layer_dist = getattr(item, "premature_layer_dist", None)
+        if not layer_dist:
+            continue
+        for layer, count in layer_dist.items():
+            aggregate[int(layer)] = aggregate.get(int(layer), 0) + int(count)
+    return aggregate or None
 
 
 
@@ -77,7 +104,9 @@ def evaluate_compare_subset(
     post_softmax: bool = False,
     relative_top: float = 0.0,
     relative_top_value: float = -1000.0,
-) -> tuple[list[dict[str, object]], dict[str, float | int | str]]:
+    candidate_premature_layers: list[int] | None = None,
+    mature_layer: int | None = None,
+) -> tuple[list[dict[str, object]], dict[str, float | int | str | dict[str, int] | list[int] | None]]:
     """Evaluate vanilla vs DoLa-style scoring on the first N samples."""
     if max_samples <= 0:
         raise ValueError("max_samples must be a positive integer.")
@@ -87,13 +116,30 @@ def evaluate_compare_subset(
         raise ValueError("No samples were loaded for comparison evaluation.")
 
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
-    validate_premature_layer(premature_layer, num_hidden_layers)
-    mature_layer = get_mature_layer_index(num_hidden_layers)
-    pair_description = describe_dola_pair(premature_layer, mature_layer)
+    resolved_mature_layer = get_mature_layer_index(num_hidden_layers)
+    if mature_layer is not None:
+        validate_mature_layer(mature_layer, num_hidden_layers)
+        resolved_mature_layer = mature_layer
+
+    if dola_score_mode == "official_dynamic_dola":
+        resolved_candidate_layers = validate_candidate_premature_layers(
+            candidate_premature_layers,
+            resolved_mature_layer,
+            num_hidden_layers,
+        )
+        pair_description = (
+            f"candidate_premature_layers={resolved_candidate_layers}, "
+            f"mature_layer={resolved_mature_layer}"
+        )
+    else:
+        resolved_candidate_layers = []
+        validate_candidate_premature_layers([premature_layer], resolved_mature_layer, num_hidden_layers)
+        pair_description = describe_dola_pair(premature_layer, resolved_mature_layer)
 
     vanilla_metric_rows: list[dict[str, float]] = []
     dola_metric_rows: list[dict[str, float]] = []
     sample_results: list[dict[str, object]] = []
+    overall_layer_usage: dict[int, int] = {}
 
     for index, sample in enumerate(subset):
         prompt = build_mc_prompt(sample, prompt_style=prompt_style)
@@ -130,6 +176,8 @@ def evaluate_compare_subset(
             post_softmax=post_softmax,
             relative_top=relative_top,
             relative_top_value=relative_top_value,
+            candidate_premature_layers=resolved_candidate_layers,
+            mature_layer=resolved_mature_layer,
         )
         dola_false = score_candidate_answers_dola_with_details(
             model,
@@ -142,12 +190,19 @@ def evaluate_compare_subset(
             post_softmax=post_softmax,
             relative_top=relative_top,
             relative_top_value=relative_top_value,
+            candidate_premature_layers=resolved_candidate_layers,
+            mature_layer=resolved_mature_layer,
         )
         dola_metrics = compute_mc_metrics(
             [item.score for item in dola_true],
             [item.score for item in dola_false],
         )
         dola_metric_rows.append(dola_metrics)
+
+        sample_layer_usage = _aggregate_layer_usage(dola_true + dola_false)
+        if sample_layer_usage:
+            for layer, count in sample_layer_usage.items():
+                overall_layer_usage[layer] = overall_layer_usage.get(layer, 0) + count
 
         sample_results.append(
             {
@@ -161,7 +216,8 @@ def evaluate_compare_subset(
                 "relative_top": relative_top,
                 "relative_top_value": relative_top_value,
                 "premature_layer": premature_layer,
-                "mature_layer": mature_layer,
+                "candidate_premature_layers": resolved_candidate_layers or None,
+                "mature_layer": resolved_mature_layer,
                 "vanilla": {
                     "true_scores": _serialize_candidate_scores(vanilla_true),
                     "false_scores": _serialize_candidate_scores(vanilla_false),
@@ -171,6 +227,7 @@ def evaluate_compare_subset(
                     "true_scores": _serialize_candidate_scores(dola_true),
                     "false_scores": _serialize_candidate_scores(dola_false),
                     "metrics": dola_metrics,
+                    "premature_layer_dist": _serialize_layer_dist(sample_layer_usage),
                 },
             }
         )
@@ -187,8 +244,10 @@ def evaluate_compare_subset(
             "relative_top": relative_top,
             "relative_top_value": relative_top_value,
             "premature_layer": premature_layer,
-            "mature_layer": mature_layer,
+            "candidate_premature_layers": resolved_candidate_layers or None,
+            "mature_layer": resolved_mature_layer,
             "dola_pair": pair_description,
+            "premature_layer_dist": _serialize_layer_dist(overall_layer_usage or None),
         }
     )
     return sample_results, comparison_summary
@@ -207,13 +266,16 @@ def main() -> None:
     device = config.get("device", "cpu")
     csv_path = Path(str(config["csv_path"]))
     max_samples = int(config.get("max_samples", 1))
-    premature_layer = int(config["premature_layer"])
+    premature_layer = int(config.get("premature_layer", 0))
     prompt_style = str(config.get("prompt_style", "plain_mc"))
     score_mode = str(config.get("score_mode", "sum_logprob"))
     dola_score_mode = str(config.get("dola_score_mode", "legacy_contrastive"))
     post_softmax = bool(config.get("post_softmax", False))
     relative_top = float(config.get("relative_top", 0.0))
     relative_top_value = float(config.get("relative_top_value", -1000.0))
+    candidate_premature_layers = [int(layer) for layer in config.get("candidate_premature_layers", [])]
+    mature_layer = config.get("mature_layer")
+    mature_layer = None if mature_layer is None else int(mature_layer)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
@@ -245,6 +307,8 @@ def main() -> None:
         post_softmax=post_softmax,
         relative_top=relative_top,
         relative_top_value=relative_top_value,
+        candidate_premature_layers=candidate_premature_layers,
+        mature_layer=mature_layer,
     )
 
     for result in sample_results:
@@ -255,6 +319,11 @@ def main() -> None:
             f"vanilla=({format_metrics(vanilla_metrics)}), "
             f"dola=({format_metrics(dola_metrics)})"
         )
+        if result["dola"].get("premature_layer_dist"):
+            print(
+                f"[hf_eval_compare_subset] Sample {result['sample_index']} "
+                f"premature_layer_dist={result['dola']['premature_layer_dist']}"
+            )
 
     comparison_summary.update(
         {
@@ -275,7 +344,13 @@ def main() -> None:
         json.dump(comparison_summary, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
 
+
     print(f"[hf_eval_compare_subset] Summary: {format_metrics(comparison_summary)}")
+    if comparison_summary.get("premature_layer_dist"):
+        print(
+            "[hf_eval_compare_subset] Overall premature_layer_dist: "
+            f"{comparison_summary['premature_layer_dist']}"
+        )
     print(f"[hf_eval_compare_subset] Saved sample results to: {sample_results_path}")
     print(f"[hf_eval_compare_subset] Saved summary to: {summary_path}")
 

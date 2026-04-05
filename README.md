@@ -62,7 +62,7 @@ or the full DoLa paper setup.
 - a real TruthfulQA.csv small-subset path for 7B compare runs,
 - two TruthfulQA prompt modes: `options_mc` and `direct_answer_mc`,
 - two scoring aggregation modes: `sum_logprob` and `mean_logprob`,
-- one official-aligned TruthfulQA-MC mode: `official_tfqa_mc` with `official_static_dola`.
+- one official-aligned TruthfulQA-MC mode: `official_tfqa_mc` with `official_static_dola` and `official_dynamic_dola`.
 
 ## What Comes Next
 
@@ -227,15 +227,16 @@ The project now includes a more official-aligned TruthfulQA-MC mode:
 
 - `prompt_style: official_tfqa_mc` uses a truthfulness instruction, 6 fixed demonstration QA pairs, and a final `Q: ...\nA:` target prompt.
 - `dola_score_mode: official_static_dola` moves the DoLa scoring rule closer to the official repository's static TruthfulQA evaluation path.
+- `dola_score_mode: official_dynamic_dola` adds a more official-like dynamic DoLa path that picks one premature layer per continuation token from a configured candidate layer set.
 
 A good next step is to try:
 
 ```bash
-python scripts/hf_compare_single_mc.py --config configs/mistral7b_truthfulqa_real_single_official.yaml
-python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_official.yaml
+python scripts/hf_compare_single_mc.py --config configs/mistral7b_truthfulqa_real_single_official_dynamic.yaml
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_official_dynamic.yaml
 ```
 
-This is still not a paper-identical setup: the model is still Mistral rather than the original LLaMA-v1 family, and the project still does not implement full dynamic JS layer selection.
+This is still not a paper-identical setup: the model is still Mistral rather than the original LLaMA-v1 family, and the project still does not implement the full original paper stack beyond this official-aligned dynamic layer-selection approximation.
 
 ## TinyLlama Configs
 
