@@ -19,6 +19,7 @@ SCRIPT_MODULES = [
     "scripts.hf_audit_dynamic_collapse",
     "scripts.hf_diagnose_official_parity",
     "scripts.hf_probe_early_exit_oracle_parity",
+    "scripts.hf_trace_scoring_path_consistency",
     "scripts.hf_compare_single_mc",
     "scripts.hf_eval_compare_subset",
     "scripts.hf_eval_mc_subset",
