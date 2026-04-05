@@ -16,6 +16,7 @@ CORE_MODULES = [
 
 SCRIPT_MODULES = [
     "scripts.check_env",
+    "scripts.hf_diagnose_official_parity",
     "scripts.hf_compare_single_mc",
     "scripts.hf_eval_compare_subset",
     "scripts.hf_eval_mc_subset",

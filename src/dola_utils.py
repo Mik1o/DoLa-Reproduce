@@ -31,29 +31,49 @@ def validate_mature_layer(mature_layer: int, num_hidden_layers: int) -> None:
 
 
 
+def normalize_layer_bucket(
+    layers: list[int] | None,
+    mature_layer: int,
+    num_hidden_layers: int,
+    *,
+    field_name: str = "layer bucket",
+) -> list[int]:
+    """Validate a layer bucket, keep first-seen order, and drop later duplicates."""
+    validate_mature_layer(mature_layer, num_hidden_layers)
+    if not layers:
+        raise ValueError(f"{field_name} must contain at least one layer index.")
+
+    normalized_layers: list[int] = []
+    seen: set[int] = set()
+    for raw_layer in layers:
+        layer = int(raw_layer)
+        if layer < 0:
+            raise ValueError(f"{field_name} must contain non-negative integers.")
+        if layer >= num_hidden_layers:
+            raise ValueError(
+                f"{field_name} must be smaller than num_hidden_layers ({num_hidden_layers})."
+            )
+        if layer >= mature_layer:
+            raise ValueError(f"Every layer in {field_name} must be smaller than mature_layer.")
+        if layer not in seen:
+            seen.add(layer)
+            normalized_layers.append(layer)
+    return normalized_layers
+
+
+
 def validate_candidate_premature_layers(
     candidate_premature_layers: list[int] | None,
     mature_layer: int,
     num_hidden_layers: int,
 ) -> list[int]:
     """Validate and normalize candidate premature layers for dynamic DoLa scoring."""
-    validate_mature_layer(mature_layer, num_hidden_layers)
-    if not candidate_premature_layers:
-        raise ValueError("candidate_premature_layers must contain at least one layer index.")
-
-    normalized_layers = sorted(set(int(layer) for layer in candidate_premature_layers))
-    if len(normalized_layers) != len(candidate_premature_layers):
-        raise ValueError("candidate_premature_layers must not contain duplicate layers.")
-    if any(layer < 0 for layer in normalized_layers):
-        raise ValueError("candidate_premature_layers must contain non-negative integers.")
-    if any(layer >= num_hidden_layers for layer in normalized_layers):
-        raise ValueError(
-            "candidate_premature_layers must be smaller than num_hidden_layers "
-            f"({num_hidden_layers})."
-        )
-    if any(layer >= mature_layer for layer in normalized_layers):
-        raise ValueError("Every candidate premature layer must be smaller than mature_layer.")
-    return normalized_layers
+    return normalize_layer_bucket(
+        candidate_premature_layers,
+        mature_layer,
+        num_hidden_layers,
+        field_name="candidate_premature_layers",
+    )
 
 
 
@@ -98,4 +118,4 @@ def validate_dola_layers(dola_layers: list[int] | None) -> list[int]:
         return []
     if any(layer < 0 for layer in dola_layers):
         raise ValueError("dola_layers must contain non-negative integers.")
-    return sorted(set(dola_layers))
+    return list(dict.fromkeys(int(layer) for layer in dola_layers))

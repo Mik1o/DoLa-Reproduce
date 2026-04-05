@@ -238,6 +238,21 @@ python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_r
 
 This is still not a paper-identical setup: the model is still Mistral rather than the original LLaMA-v1 family, and the project still does not implement the full original paper stack beyond this official-aligned dynamic layer-selection approximation.
 
+## Official Parity Diagnosis
+
+The project now also includes a small official-parity diagnosis pass. Its goal is not to improve scores, but to answer two narrower questions:
+
+- whether `official_dynamic_dola` is behaving almost like `official_static_dola` with a single dominant layer,
+- and whether shifting the candidate layer bucket changes results enough to suggest an off-by-one issue.
+
+Run it with:
+
+```bash
+python scripts/hf_diagnose_official_parity.py --config configs/mistral7b_truthfulqa_real_official_diagnose.yaml
+```
+
+This still does **not** run the full TruthfulQA benchmark, does **not** do layer sweep experiments, and is still not paper-identical because the model is Mistral rather than the original LLaMA-v1 family.
+
 ## TinyLlama Configs
 
 In addition to the tiny-random fallback configs, the project now includes a

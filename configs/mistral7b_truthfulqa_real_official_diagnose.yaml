@@ -1,0 +1,19 @@
+task_name: "mistral7b_truthfulqa_real_official_diagnose"
+model_name: "/home/yifei/DoLa-Reproduce/models/Mistral-7B-v0.1"
+device: "cuda"
+torch_dtype: "float16"
+use_fast_tokenizer: true
+trust_remote_code: false
+attn_implementation: "sdpa"
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+max_samples: 5
+mature_layer: 31
+static_premature_layers: [15, 17]
+candidate_premature_layers: [15, 17, 19, 21, 23, 25, 27, 29]
+candidate_premature_layers_shifted: [16, 18, 20, 22, 24, 26, 28, 30]
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+output_dir: "outputs/mistral7b_truthfulqa_real_official_diagnose"

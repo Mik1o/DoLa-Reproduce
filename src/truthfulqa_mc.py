@@ -121,21 +121,59 @@ def parse_list_field(raw: str | None, *, field_name: str = "list field") -> list
 
 
 
+def split_multi_answer(ans: str | None, sep: str = ";", close: bool = True) -> list[str]:
+    """Split multi-answer fields in the same spirit as official tfqa_mc_eval.py.
+
+    The official DoLa TruthfulQA-MC script uses `split_multi_answer(...)` to split
+    semicolon-separated answers and append a trailing period when `close=True`.
+    We keep the same core behavior here while still filtering out empty items so
+    the rest of this lightweight project gets clearer data validation.
+    """
+    if _is_missing(ans):
+        return []
+    if not isinstance(ans, str):
+        raise TypeError(f"Expected multi-answer text to be string-like, but received {type(ans)!r}.")
+
+    answers = ans.strip().split(sep)
+    split_answers: list[str] = []
+    for answer in answers:
+        normalized_answer = answer.strip()
+        if not normalized_answer:
+            continue
+        split_answers.append(_format_tfqa_answer_text(normalized_answer, close=close))
+    return split_answers
+
+
+
+def format_best_answer(best_ans: str, close: bool = True) -> str:
+    """Format the best answer in the same spirit as official tfqa_mc_eval.py."""
+    if not isinstance(best_ans, str):
+        raise TypeError(f"Expected best answer to be string-like, but received {type(best_ans)!r}.")
+    best = best_ans.strip()
+    if not best:
+        raise ValueError("best_answer must be a non-empty string.")
+    return _format_tfqa_answer_text(best, close=close)
+
+
+
 def normalize_truthfulqa_row(row: pd.Series) -> TruthfulQASample:
     question = _get_required_text(row, QUESTION_FIELDS, field_label="question")
-    best_answer = _get_required_text(row, BEST_ANSWER_FIELDS, field_label="best_answer")
+    raw_best_answer = _get_required_text(row, BEST_ANSWER_FIELDS, field_label="best_answer")
+    best_answer = format_best_answer(raw_best_answer)
 
     try:
-        correct_answers = parse_list_field(
-            _get_optional_value(row, CORRECT_ANSWER_FIELDS),
+        raw_correct_value = _get_optional_value(row, CORRECT_ANSWER_FIELDS)
+        correct_answers = _parse_truthfulqa_answer_field(
+            raw_correct_value,
             field_name="correct_answers",
         )
     except (TypeError, ValueError) as error:
         raise ValueError(f"Row {row.name!r} has invalid correct_answers: {error}") from error
 
     try:
-        incorrect_answers = parse_list_field(
-            _get_optional_value(row, INCORRECT_ANSWER_FIELDS),
+        raw_incorrect_value = _get_optional_value(row, INCORRECT_ANSWER_FIELDS)
+        incorrect_answers = _parse_truthfulqa_answer_field(
+            raw_incorrect_value,
             field_name="incorrect_answers",
         )
     except (TypeError, ValueError) as error:
@@ -254,6 +292,29 @@ def _build_official_tfqa_mc_prompt(sample: TruthfulQASample) -> str:
     lines.append(f"Q: {sample.question}")
     lines.append("A:")
     return "\n".join(lines)
+
+
+
+def _parse_truthfulqa_answer_field(raw: Any, *, field_name: str) -> list[str]:
+    """Parse answer fields in a way that stays close to official tfqa_mc_eval.py."""
+    if _is_missing(raw):
+        return []
+    if isinstance(raw, str) and ";" in raw:
+        return split_multi_answer(raw)
+
+    parsed_answers = parse_list_field(raw, field_name=field_name)
+    return [_format_tfqa_answer_text(answer) for answer in parsed_answers]
+
+
+
+def _format_tfqa_answer_text(answer: str, close: bool = True) -> str:
+    """Format answer text to mirror official format_best/split_multi_answer behavior."""
+    normalized_answer = answer.strip()
+    if not normalized_answer:
+        return normalized_answer
+    if close and normalized_answer[-1] != ".":
+        normalized_answer = normalized_answer + "."
+    return normalized_answer
 
 
 
