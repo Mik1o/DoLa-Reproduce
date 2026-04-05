@@ -606,12 +606,11 @@ def _compute_official_dola_token_scores(
 
 
 
-def _select_dynamic_base_logits(
+def _compute_dynamic_js_divergence(
     mature_logits: Any,
     candidate_logits: Any,
-    candidate_layers: list[int],
-) -> tuple[Any, list[int]]:
-    """Pick one premature layer per token position via JS divergence."""
+) -> Any:
+    """Compute per-layer, per-token JS divergence for official dynamic DoLa."""
     try:
         import torch
         import torch.nn.functional as F
@@ -640,7 +639,28 @@ def _select_dynamic_base_logits(
         mixture,
         reduction="none",
     ).mean(dim=-1)
-    js_divergence = 0.5 * (kl_mature + kl_candidate)
+    return 0.5 * (kl_mature + kl_candidate)
+
+
+
+def _select_dynamic_base_logits(
+    mature_logits: Any,
+    candidate_logits: Any,
+    candidate_layers: list[int],
+) -> tuple[Any, list[int]]:
+    """Pick one premature layer per token position via JS divergence."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    js_divergence = _compute_dynamic_js_divergence(
+        mature_logits=mature_logits,
+        candidate_logits=candidate_logits,
+    )
     selected_indices = js_divergence.mean(dim=1).argmax(dim=0)
 
     seq_len = int(mature_logits.shape[1])
