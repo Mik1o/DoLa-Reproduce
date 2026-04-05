@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
         "--prompt-style",
         type=str,
         default="options_mc",
-        help="Prompt style to preview: options_mc or direct_answer_mc.",
+        help="Prompt style to preview: options_mc, direct_answer_mc, or official_tfqa_mc.",
     )
     return parser.parse_args()
 

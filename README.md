@@ -61,7 +61,8 @@ or the full DoLa paper setup.
 - 7B-ready config templates for WSL smoke and compare runs,
 - a real TruthfulQA.csv small-subset path for 7B compare runs,
 - two TruthfulQA prompt modes: `options_mc` and `direct_answer_mc`,
-- two scoring aggregation modes: `sum_logprob` and `mean_logprob`.
+- two scoring aggregation modes: `sum_logprob` and `mean_logprob`,
+- one official-aligned TruthfulQA-MC mode: `official_tfqa_mc` with `official_static_dola`.
 
 ## What Comes Next
 
@@ -219,6 +220,22 @@ The project now supports two candidate scoring aggregation modes:
 - `mean_logprob`: continuation log-prob sum divided by the scored continuation token count.
 
 `mean_logprob` is not a new algorithm. It is only a diagnostic control for checking whether direct-answer scoring is being dominated by answer-length bias. A good next step is to compare both modes on the same real-data subset before doing anything larger.
+
+## Official-Aligned TruthfulQA-MC Mode
+
+The project now includes a more official-aligned TruthfulQA-MC mode:
+
+- `prompt_style: official_tfqa_mc` uses a truthfulness instruction, 6 fixed demonstration QA pairs, and a final `Q: ...\nA:` target prompt.
+- `dola_score_mode: official_static_dola` moves the DoLa scoring rule closer to the official repository's static TruthfulQA evaluation path.
+
+A good next step is to try:
+
+```bash
+python scripts/hf_compare_single_mc.py --config configs/mistral7b_truthfulqa_real_single_official.yaml
+python scripts/hf_eval_compare_subset.py --config configs/mistral7b_truthfulqa_real_subset_official.yaml
+```
+
+This is still not a paper-identical setup: the model is still Mistral rather than the original LLaMA-v1 family, and the project still does not implement full dynamic JS layer selection.
 
 ## TinyLlama Configs
 

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from src.truthfulqa_mc import (
+    build_answer_continuation,
     build_mc_prompt,
     load_truthfulqa_samples,
     parse_list_field,
@@ -83,6 +84,25 @@ def test_build_mc_prompt_direct_mode_hides_candidates() -> None:
     assert "Paris" not in prompt
     assert "London" not in prompt
     assert "Options:" not in prompt
+
+
+
+def test_build_mc_prompt_official_mode_matches_demo_structure() -> None:
+    """The official-aligned prompt should contain instruction, demos, and Q/A cue."""
+    sample = load_truthfulqa_samples(FIXTURE_CSV)[0]
+    prompt = build_mc_prompt(sample, prompt_style="official_tfqa_mc")
+
+    assert 'Interpret each question literally' in prompt
+    assert prompt.count('Q: ') == 7
+    assert 'Q: What is human life expectancy in the United States?' in prompt
+    assert prompt.rstrip().endswith('A:')
+
+
+
+def test_build_answer_continuation_uses_leading_space_for_official_mode() -> None:
+    """The official-aligned scoring continuation should start with one space."""
+    assert build_answer_continuation('Paris', prompt_style='official_tfqa_mc') == ' Paris'
+    assert build_answer_continuation('Paris', prompt_style='direct_answer_mc') == 'Paris'
 
 
 

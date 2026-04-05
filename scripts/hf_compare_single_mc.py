@@ -73,6 +73,10 @@ def main() -> None:
     premature_layer = int(config["premature_layer"])
     prompt_style = str(config.get("prompt_style", "plain_mc"))
     score_mode = str(config.get("score_mode", "sum_logprob"))
+    dola_score_mode = str(config.get("dola_score_mode", "legacy_contrastive"))
+    post_softmax = bool(config.get("post_softmax", False))
+    relative_top = float(config.get("relative_top", 0.0))
+    relative_top_value = float(config.get("relative_top_value", -1000.0))
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
 
@@ -84,11 +88,12 @@ def main() -> None:
 
     sample = samples[sample_index]
     prompt = build_mc_prompt(sample, prompt_style=prompt_style)
-    true_candidates, false_candidates = get_mc_candidate_sets(sample)
+    true_candidates, false_candidates = get_mc_candidate_sets(sample, prompt_style=prompt_style)
 
     print(f"[hf_compare_single_mc] Model: {model_name}")
     print(f"[hf_compare_single_mc] Device: {device}")
     print(f"[hf_compare_single_mc] Score mode: {score_mode}")
+    print(f"[hf_compare_single_mc] DoLa score mode: {dola_score_mode}")
     print(f"[hf_compare_single_mc] Output directory: {output_dir}")
 
     model, tokenizer = load_model_and_tokenizer(
@@ -128,6 +133,10 @@ def main() -> None:
         true_candidates,
         premature_layer=premature_layer,
         score_mode=score_mode,
+        dola_score_mode=dola_score_mode,
+        post_softmax=post_softmax,
+        relative_top=relative_top,
+        relative_top_value=relative_top_value,
     )
     dola_false = score_candidate_answers_dola_with_details(
         model,
@@ -136,6 +145,10 @@ def main() -> None:
         false_candidates,
         premature_layer=premature_layer,
         score_mode=score_mode,
+        dola_score_mode=dola_score_mode,
+        post_softmax=post_softmax,
+        relative_top=relative_top,
+        relative_top_value=relative_top_value,
     )
     dola_metrics = compute_mc_metrics(
         [item.score for item in dola_true],
@@ -155,6 +168,10 @@ def main() -> None:
         "prompt": prompt,
         "prompt_style": prompt_style,
         "score_mode": score_mode,
+        "dola_score_mode": dola_score_mode,
+        "post_softmax": post_softmax,
+        "relative_top": relative_top,
+        "relative_top_value": relative_top_value,
         "premature_layer": premature_layer,
         "mature_layer": mature_layer,
         "vanilla": {

@@ -1,0 +1,17 @@
+task_name: "mistral7b_truthfulqa_real_subset_official"
+model_name: "/home/yifei/DoLa-Reproduce/models/Mistral-7B-v0.1"
+device: "cuda"
+torch_dtype: "float16"
+use_fast_tokenizer: true
+trust_remote_code: false
+attn_implementation: "sdpa"
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+dola_score_mode: "official_static_dola"
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+max_samples: 5
+premature_layer: 8
+output_dir: "outputs/mistral7b_truthfulqa_real_subset_official"

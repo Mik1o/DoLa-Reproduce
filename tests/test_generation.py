@@ -8,6 +8,7 @@ from src.generation import (
     _aggregate_continuation_log_probs,
     _build_scoring_text_attempts,
     _find_continuation_token_index,
+    _normalize_dola_score_mode,
     _prepare_scoring_inputs,
 )
 
@@ -111,6 +112,14 @@ def test_build_scoring_text_attempts_adds_boundary_and_strips_leading_space() ->
 
 
 
+def test_build_scoring_text_attempts_preserves_explicit_leading_space() -> None:
+    """Official-aligned continuations should keep the intentional leading space."""
+    attempts = _build_scoring_text_attempts("A:", " Paris", " ")
+
+    assert attempts[0] == ("A:", "A: Paris")
+
+
+
 def test_find_continuation_token_index_uses_end_offset_for_cross_boundary_token() -> None:
     """A token that overlaps the prompt/candidate boundary still counts as continuation."""
     token_index = _find_continuation_token_index(
@@ -186,3 +195,9 @@ def test_aggregate_continuation_log_probs_mean_mode_normalizes_by_token_count() 
 
     assert score == -2.0
     assert token_count == 3
+
+
+
+def test_normalize_dola_score_mode_accepts_official_static_dola() -> None:
+    """The new official-aligned DoLa score mode should be recognized."""
+    assert _normalize_dola_score_mode('official_static_dola') == 'official_static_dola'

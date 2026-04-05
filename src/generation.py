@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -96,19 +97,17 @@ def score_candidate_answers_with_details(
     if not candidate_answers:
         raise ValueError("candidate_answers must contain at least one answer.")
 
-    scored_candidates: list[CandidateScore] = []
-    for candidate_answer in candidate_answers:
-        scored_candidates.append(
-            score_continuation_details(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                candidate_answer=candidate_answer,
-                separator=separator,
-                score_mode=score_mode,
-            )
+    return [
+        score_continuation_details(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            candidate_answer=candidate_answer,
+            separator=separator,
+            score_mode=score_mode,
         )
-    return scored_candidates
+        for candidate_answer in candidate_answers
+    ]
 
 
 
@@ -147,11 +146,7 @@ def score_continuation_details(
         continuation_log_probs=continuation_log_probs,
         score_mode=score_mode,
     )
-    return CandidateScore(
-        candidate=candidate_answer,
-        score=score,
-        continuation_token_count=continuation_token_count,
-    )
+    return CandidateScore(candidate=candidate_answer, score=score, continuation_token_count=continuation_token_count)
 
 
 
@@ -163,8 +158,12 @@ def score_continuation_dola_logprob(
     premature_layer: int,
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    dola_score_mode: str = "legacy_contrastive",
+    post_softmax: bool = False,
+    relative_top: float = 0.0,
+    relative_top_value: float = -1000.0,
 ) -> float:
-    """Score a continuation with a minimal DoLa-style contrastive log-prob sum."""
+    """Score a continuation with configurable DoLa-style scoring."""
     return score_continuation_dola_details(
         model=model,
         tokenizer=tokenizer,
@@ -173,6 +172,10 @@ def score_continuation_dola_logprob(
         premature_layer=premature_layer,
         separator=separator,
         score_mode=score_mode,
+        dola_score_mode=dola_score_mode,
+        post_softmax=post_softmax,
+        relative_top=relative_top,
+        relative_top_value=relative_top_value,
     ).score
 
 
@@ -185,8 +188,12 @@ def score_candidate_answers_dola(
     premature_layer: int,
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    dola_score_mode: str = "legacy_contrastive",
+    post_softmax: bool = False,
+    relative_top: float = 0.0,
+    relative_top_value: float = -1000.0,
 ) -> list[tuple[str, float]]:
-    """Score each candidate answer with minimal DoLa-style contrastive scoring."""
+    """Score each candidate answer with configurable DoLa-style scoring."""
     return [
         (item.candidate, item.score)
         for item in score_candidate_answers_dola_with_details(
@@ -197,6 +204,10 @@ def score_candidate_answers_dola(
             premature_layer=premature_layer,
             separator=separator,
             score_mode=score_mode,
+            dola_score_mode=dola_score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
         )
     ]
 
@@ -210,25 +221,31 @@ def score_candidate_answers_dola_with_details(
     premature_layer: int,
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    dola_score_mode: str = "legacy_contrastive",
+    post_softmax: bool = False,
+    relative_top: float = 0.0,
+    relative_top_value: float = -1000.0,
 ) -> list[CandidateScore]:
     """Score each candidate answer with DoLa-style scoring and token counts."""
     if not candidate_answers:
         raise ValueError("candidate_answers must contain at least one answer.")
 
-    scored_candidates: list[CandidateScore] = []
-    for candidate_answer in candidate_answers:
-        scored_candidates.append(
-            score_continuation_dola_details(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt,
-                candidate_answer=candidate_answer,
-                premature_layer=premature_layer,
-                separator=separator,
-                score_mode=score_mode,
-            )
+    return [
+        score_continuation_dola_details(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            candidate_answer=candidate_answer,
+            premature_layer=premature_layer,
+            separator=separator,
+            score_mode=score_mode,
+            dola_score_mode=dola_score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
         )
-    return scored_candidates
+        for candidate_answer in candidate_answers
+    ]
 
 
 
@@ -240,8 +257,12 @@ def score_continuation_dola_details(
     premature_layer: int,
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    dola_score_mode: str = "legacy_contrastive",
+    post_softmax: bool = False,
+    relative_top: float = 0.0,
+    relative_top_value: float = -1000.0,
 ) -> CandidateScore:
-    """Score one candidate with DoLa-style contrastive logits and token counts.
+    """Score one candidate with configurable DoLa-style scoring and token counts.
 
     Notes
     -----
@@ -267,12 +288,12 @@ def score_continuation_dola_details(
 
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
     validate_premature_layer(premature_layer, num_hidden_layers)
-    mature_layer = get_mature_layer_index(num_hidden_layers)
-    del mature_layer
 
     lm_head = model.get_output_embeddings()
     if lm_head is None:
         raise ValueError("The model does not expose output embeddings for DoLa-style scoring.")
+
+    normalized_dola_mode = _normalize_dola_score_mode(dola_score_mode)
 
     with torch.no_grad():
         outputs = model(
@@ -286,22 +307,32 @@ def score_continuation_dola_details(
 
         mature_hidden = hidden_states[-1]
         premature_hidden = hidden_states[premature_layer + 1]
-
         mature_logits = lm_head(mature_hidden[:, :-1, :])
         premature_logits = lm_head(premature_hidden[:, :-1, :])
-        contrastive_logits = mature_logits - premature_logits
-        token_log_probs = _gather_token_log_probs(contrastive_logits, input_ids)
 
-    continuation_log_probs = token_log_probs[:, _get_continuation_start_index(prompt_len) :]
+        if normalized_dola_mode == "legacy_contrastive":
+            token_scores = _gather_token_log_probs(mature_logits - premature_logits, input_ids)
+        else:
+            final_log_probs = torch.log_softmax(mature_logits, dim=-1)
+            base_log_probs = torch.log_softmax(premature_logits, dim=-1)
+            diff_logits = final_log_probs - base_log_probs
+            if post_softmax:
+                diff_logits = torch.log_softmax(diff_logits, dim=-1)
+            if relative_top > 0.0:
+                diff_logits = _apply_relative_top_mask(
+                    diff_logits=diff_logits,
+                    final_log_probs=final_log_probs,
+                    relative_top=relative_top,
+                    relative_top_value=relative_top_value,
+                )
+            token_scores = _gather_scores_at_target_ids(diff_logits, input_ids)
+
+    continuation_scores = token_scores[:, _get_continuation_start_index(prompt_len) :]
     score, continuation_token_count = _aggregate_continuation_log_probs(
-        continuation_log_probs=continuation_log_probs,
+        continuation_log_probs=continuation_scores,
         score_mode=score_mode,
     )
-    return CandidateScore(
-        candidate=candidate_answer,
-        score=score,
-        continuation_token_count=continuation_token_count,
-    )
+    return CandidateScore(candidate=candidate_answer, score=score, continuation_token_count=continuation_token_count)
 
 
 
@@ -336,8 +367,7 @@ def _prepare_scoring_inputs(
     if not candidate_answer.strip():
         raise ValueError("candidate_answer must be a non-empty string.")
 
-    cleaned_candidate = candidate_answer.lstrip()
-    attempts = _build_scoring_text_attempts(prompt, cleaned_candidate, separator)
+    attempts = _build_scoring_text_attempts(prompt, candidate_answer, separator)
 
     for prompt_text, full_text in attempts:
         offset_result = _prepare_scoring_inputs_with_offsets(
@@ -374,10 +404,22 @@ def _build_scoring_text_attempts(
 ) -> list[tuple[str, str]]:
     """Build prompt/full-text attempts with slightly different token boundaries."""
     normalized_separator = separator or " "
-    normalized_candidate = candidate_answer.lstrip()
+    preserve_leading_separator = bool(
+        normalized_separator
+        and candidate_answer.startswith(normalized_separator)
+        and not candidate_answer.startswith(normalized_separator * 2)
+    )
+    normalized_candidate = (
+        candidate_answer if preserve_leading_separator else candidate_answer.lstrip()
+    )
 
-    primary_prompt = prompt if prompt[-1].isspace() else f"{prompt}{normalized_separator}"
-    fallback_prompt = f"{prompt.rstrip()}{normalized_separator}"
+    prompt_needs_separator = not prompt[-1].isspace() and not preserve_leading_separator
+    primary_prompt = f"{prompt}{normalized_separator}" if prompt_needs_separator else prompt
+    fallback_prompt = (
+        f"{prompt.rstrip()}{normalized_separator}"
+        if not preserve_leading_separator
+        else prompt.rstrip()
+    )
 
     attempts: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -465,6 +507,13 @@ def _gather_token_log_probs(logits: Any, input_ids: Any) -> Any:
 
 
 
+def _gather_scores_at_target_ids(scores: Any, input_ids: Any) -> Any:
+    """Gather already-normalized token scores at the target token ids."""
+    target_ids = input_ids[:, 1:]
+    return scores.gather(-1, target_ids.unsqueeze(-1)).squeeze(-1)
+
+
+
 def _aggregate_continuation_log_probs(
     continuation_log_probs: Any,
     score_mode: str,
@@ -490,6 +539,43 @@ def _normalize_score_mode(score_mode: str) -> str:
             f"Unsupported score_mode '{score_mode}'. Use 'sum_logprob' or 'mean_logprob'."
         )
     return normalized_mode
+
+
+
+def _normalize_dola_score_mode(dola_score_mode: str) -> str:
+    """Normalize the DoLa scoring rule used for candidate comparison."""
+    normalized_mode = dola_score_mode.strip().lower()
+    if normalized_mode not in {"legacy_contrastive", "official_static_dola"}:
+        raise ValueError(
+            "Unsupported dola_score_mode "
+            f"'{dola_score_mode}'. Use 'legacy_contrastive' or 'official_static_dola'."
+        )
+    return normalized_mode
+
+
+
+def _apply_relative_top_mask(
+    diff_logits: Any,
+    final_log_probs: Any,
+    relative_top: float,
+    relative_top_value: float,
+) -> Any:
+    """Mask low-probability tokens relative to the final-layer distribution."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    if relative_top <= 0.0:
+        return diff_logits
+
+    max_log_probs = final_log_probs.max(dim=-1, keepdim=True).values
+    threshold = max_log_probs + math.log(relative_top)
+    mask = final_log_probs < threshold
+    return torch.where(mask, torch.full_like(diff_logits, relative_top_value), diff_logits)
 
 
 
