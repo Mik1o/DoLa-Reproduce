@@ -100,8 +100,9 @@ def _compute_win_tie_loss(
     ties = 0
     losses = 0
     for dynamic_sample, static_sample in zip(dynamic_samples, static_samples, strict=False):
-        dynamic_value = float(dynamic_sample["dola"]["metrics"][metric])
-        static_value = float(static_sample["dola"]["metrics"][metric])
+        metric_key = metric if metric in dynamic_sample["dola"]["metrics"] else metric.upper()
+        dynamic_value = float(dynamic_sample["dola"]["metrics"][metric_key])
+        static_value = float(static_sample["dola"]["metrics"][metric_key])
         if dynamic_value > static_value + tol:
             wins += 1
         elif dynamic_value < static_value - tol:
