@@ -17,7 +17,7 @@ from scripts.hf_eval_compare_subset import LOAD_CONFIG_KEYS, evaluate_compare_su
 from src.dola_utils import normalize_layer_bucket
 from src.modeling import load_model_and_tokenizer
 from src.truthfulqa_mc import load_truthfulqa_samples
-from src.utils import ensure_output_dir, load_yaml_config
+from src.utils import ensure_output_dir, load_yaml_config, select_fixed_subset
 
 
 
@@ -109,6 +109,8 @@ def main() -> None:
     device = config.get("device", "cpu")
     csv_path = Path(str(config["csv_path"]))
     max_samples = int(config.get("max_samples", 5))
+    subset_seed = config.get("subset_seed")
+    subset_seed = None if subset_seed is None else int(subset_seed)
     prompt_style = str(config.get("prompt_style", "official_tfqa_mc"))
     score_mode = str(config.get("score_mode", "sum_logprob"))
     post_softmax = bool(config.get("post_softmax", False))
@@ -124,10 +126,12 @@ def main() -> None:
     print(f"[hf_diagnose_official_parity] Model: {model_name}")
     print(f"[hf_diagnose_official_parity] CSV: {csv_path}")
     print(f"[hf_diagnose_official_parity] Output directory: {output_dir}")
+    print(f"[hf_diagnose_official_parity] Subset size: {max_samples}, subset_seed={subset_seed}")
 
     samples = load_truthfulqa_samples(csv_path)
     if not samples:
         raise ValueError("No TruthfulQA samples were loaded for diagnosis.")
+    subset_samples, subset_indices = select_fixed_subset(samples, max_samples, subset_seed)
 
     model, tokenizer = load_model_and_tokenizer(
         model_name=model_name,
@@ -166,8 +170,8 @@ def main() -> None:
         _, compare_summary = evaluate_compare_subset(
             model,
             tokenizer,
-            samples,
-            max_samples=max_samples,
+            subset_samples,
+            max_samples=len(subset_samples),
             premature_layer=static_layer,
             prompt_style=prompt_style,
             score_mode=score_mode,
@@ -188,8 +192,8 @@ def main() -> None:
     _, dynamic_current_summary = evaluate_compare_subset(
         model,
         tokenizer,
-        samples,
-        max_samples=max_samples,
+        subset_samples,
+        max_samples=len(subset_samples),
         premature_layer=normalized_current_bucket[0],
         prompt_style=prompt_style,
         score_mode=score_mode,
@@ -206,8 +210,8 @@ def main() -> None:
         _, dynamic_shifted_summary = evaluate_compare_subset(
             model,
             tokenizer,
-            samples,
-            max_samples=max_samples,
+            subset_samples,
+            max_samples=len(subset_samples),
             premature_layer=normalized_shifted_bucket[0],
             prompt_style=prompt_style,
             score_mode=score_mode,
@@ -225,6 +229,8 @@ def main() -> None:
         "model_name": model_name,
         "csv_path": str(csv_path),
         "max_samples": max_samples,
+        "subset_seed": subset_seed,
+        "subset_indices": subset_indices,
         "prompt_style": prompt_style,
         "score_mode": score_mode,
         "mature_layer": mature_layer,
@@ -233,7 +239,7 @@ def main() -> None:
         "relative_top_value": relative_top_value,
         "answer_format_audit": {
             "aligned_to": "tfqa_mc_eval.py split_multi_answer / format_best",
-            "preview": _build_answer_format_audit(samples),
+            "preview": _build_answer_format_audit(subset_samples),
         },
         "runs": {
             "vanilla_official": vanilla_summary,

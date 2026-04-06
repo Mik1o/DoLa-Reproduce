@@ -26,6 +26,7 @@ SCRIPT_MODULES = [
     "scripts.hf_eval_mc_subset",
     "scripts.hf_score_single_mc",
     "scripts.hf_smoke_test",
+    "scripts.hf_summarize_cross_model_baseline",
     "scripts.hf_sweep_premature_layers",
     "scripts.inspect_truthfulqa_data",
     "scripts.inspect_truthfulqa_real_csv",

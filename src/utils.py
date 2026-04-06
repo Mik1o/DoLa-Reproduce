@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+import random
+from typing import Any, Sequence, TypeVar
 
 import yaml
 
@@ -28,3 +29,27 @@ def ensure_output_dir(output_dir: str | Path) -> Path:
 def resolve_project_root() -> Path:
     """Return the repository root based on the current file location."""
     return Path(__file__).resolve().parent.parent
+
+
+T = TypeVar("T")
+
+
+def select_fixed_subset(items: Sequence[T], size: int, seed: int | None = None) -> tuple[list[T], list[int]]:
+    """Select a reproducible subset and return both items and original indices."""
+    if size <= 0:
+        raise ValueError("size must be a positive integer.")
+
+    total = len(items)
+    if total == 0:
+        raise ValueError("Cannot select a subset from an empty sequence.")
+
+    if size >= total:
+        indices = list(range(total))
+        return [items[index] for index in indices], indices
+
+    if seed is None:
+        indices = list(range(size))
+    else:
+        rng = random.Random(seed)
+        indices = sorted(rng.sample(range(total), size))
+    return [items[index] for index in indices], indices

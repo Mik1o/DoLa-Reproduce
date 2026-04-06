@@ -24,7 +24,7 @@ from src.generation import (
 )
 from src.modeling import load_model_and_tokenizer
 from src.truthfulqa_mc import build_answer_continuation, build_mc_prompt, load_truthfulqa_samples
-from src.utils import ensure_output_dir, load_yaml_config
+from src.utils import ensure_output_dir, load_yaml_config, select_fixed_subset
 
 
 LOAD_CONFIG_KEYS = (
@@ -279,6 +279,8 @@ def main() -> None:
     device = config.get("device", "cpu")
     csv_path = Path(str(config["csv_path"]))
     max_samples = int(config.get("max_samples", 5))
+    subset_seed = config.get("subset_seed")
+    subset_seed = None if subset_seed is None else int(subset_seed)
     prompt_style = str(config.get("prompt_style", "official_tfqa_mc"))
     mature_layer = int(config["mature_layer"])
     current_bucket = [int(layer) for layer in config["candidate_premature_layers"]]
@@ -292,9 +294,11 @@ def main() -> None:
     print(f"[hf_audit_dynamic_collapse] Model: {model_name}")
     print(f"[hf_audit_dynamic_collapse] CSV: {csv_path}")
     print(f"[hf_audit_dynamic_collapse] Output directory: {output_dir}")
+    print(f"[hf_audit_dynamic_collapse] Subset size: {max_samples}, subset_seed={subset_seed}")
 
-    samples = load_truthfulqa_samples(csv_path)[:max_samples]
-    if not samples:
+    samples = load_truthfulqa_samples(csv_path)
+    subset_samples, subset_indices = select_fixed_subset(samples, max_samples, subset_seed)
+    if not subset_samples:
         raise ValueError("No TruthfulQA samples were loaded for dynamic collapse auditing.")
 
     model, tokenizer = load_model_and_tokenizer(
@@ -304,7 +308,7 @@ def main() -> None:
     )
 
     case_reports: list[dict[str, object]] = []
-    for sample_index, sample in enumerate(samples):
+    for subset_position, (sample_index, sample) in enumerate(zip(subset_indices, subset_samples, strict=False)):
         prompt = build_mc_prompt(sample, prompt_style=prompt_style)
         for answer_name, candidate_answer in _candidate_entries(sample, prompt_style):
             current_report = _compute_bucket_report(
@@ -331,6 +335,7 @@ def main() -> None:
             )
             case_report = {
                 "sample_index": sample_index,
+                "subset_position": subset_position,
                 "question": sample.question,
                 "answer_name": answer_name,
                 "candidate_answer": candidate_answer,
@@ -347,6 +352,8 @@ def main() -> None:
         "model_name": model_name,
         "csv_path": str(csv_path),
         "max_samples": max_samples,
+        "subset_seed": subset_seed,
+        "subset_indices": subset_indices,
         "prompt_style": prompt_style,
         "mature_layer": mature_layer,
         "current_bucket": current_bucket,
