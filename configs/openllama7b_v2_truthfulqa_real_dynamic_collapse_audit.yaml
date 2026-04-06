@@ -1,0 +1,20 @@
+task_name: "openllama7b_v2_truthfulqa_real_dynamic_collapse_audit"
+# Internal layer ids are zero-based; current bucket corresponds to official ids 16,18,...,30.
+model_name: "/home/yifei/DoLa-Reproduce/models/open_llama_7b_v2"
+device: "cuda"
+torch_dtype: "float16"
+use_fast_tokenizer: false
+tokenizer_class: "LlamaTokenizer"
+trust_remote_code: false
+attn_implementation: "sdpa"
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+max_samples: 5
+mature_layer: 31
+candidate_premature_layers: [15, 17, 19, 21, 23, 25, 27, 29]
+candidate_premature_layers_shifted: [16, 18, 20, 22, 24, 26, 28, 30]
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+output_dir: "outputs/openllama7b_v2_truthfulqa_real_dynamic_collapse_audit"
