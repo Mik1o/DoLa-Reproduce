@@ -197,6 +197,86 @@ def _load_tokenizer(
 
 
 
+def _retry_openllama_tokenizer_load(
+    *,
+    model_name: str,
+    llama_tokenizer_cls: Any,
+    tokenizer_load_kwargs: dict[str, Any],
+    original_error: Exception,
+) -> Any | None:
+    """Retry OpenLLaMA tokenizer loading via a clean local snapshot when cache parsing fails."""
+    if not _looks_like_openllama_model(model_name):
+        return None
+
+    _ensure_protobuf_available(model_name=model_name, original_error=original_error)
+
+    error_text = str(original_error).lower()
+    parse_like_error = "tiktoken" in error_text or "error parsing line" in error_text
+    if not parse_like_error:
+        return None
+
+    if Path(model_name).exists():
+        tokenizer_model_path = Path(model_name) / "tokenizer.model"
+        raise RuntimeError(
+            "OpenLLaMA tokenizer loading failed from a local directory. "
+            f"The tokenizer file at '{tokenizer_model_path}' may be corrupted or incomplete. "
+            "Please re-download the model directory with `hf download openlm-research/open_llama_7b_v2 --local-dir ...` "
+            "and keep `use_fast_tokenizer: false` plus `tokenizer_class: \"LlamaTokenizer\"`."
+        ) from original_error
+
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as error:
+        raise ImportError(
+            "huggingface_hub is required for the OpenLLaMA tokenizer fallback path. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    snapshot_kwargs: dict[str, Any] = {
+        "repo_id": model_name,
+        "allow_patterns": [
+            "tokenizer.model",
+            "tokenizer_config.json",
+            "special_tokens_map.json",
+            "added_tokens.json",
+        ],
+        "force_download": True,
+    }
+    if "cache_dir" in tokenizer_load_kwargs:
+        snapshot_kwargs["cache_dir"] = tokenizer_load_kwargs["cache_dir"]
+    if "local_files_only" in tokenizer_load_kwargs:
+        snapshot_kwargs["local_files_only"] = tokenizer_load_kwargs["local_files_only"]
+
+    snapshot_dir = snapshot_download(**snapshot_kwargs)
+    _ensure_protobuf_available(model_name=snapshot_dir, original_error=original_error)
+    return llama_tokenizer_cls.from_pretrained(
+        snapshot_dir,
+        local_files_only=True,
+        **_without_use_fast(tokenizer_load_kwargs),
+    )
+
+
+
+def _looks_like_openllama_model(model_name: str) -> bool:
+    """Return True when the model path or repo id looks like OpenLLaMA."""
+    normalized = model_name.replace('\\', '/').lower()
+    return 'open_llama' in normalized
+
+
+
+def _ensure_protobuf_available(*, model_name: str, original_error: Exception) -> None:
+    """Raise a clear error if OpenLLaMA slow tokenizer dependencies are incomplete."""
+    try:
+        import google.protobuf  # noqa: F401
+    except ImportError as error:
+        raise ImportError(
+            "OpenLLaMA tokenizer loading requires the `protobuf` package in addition to sentencepiece. "
+            f"Current model_name='{model_name}'. Install it with `pip install protobuf` or reinstall `requirements-model.txt`, "
+            "then retry the same command."
+        ) from error
+
+
+
 def _without_use_fast(tokenizer_load_kwargs: dict[str, Any]) -> dict[str, Any]:
     """Drop use_fast for slow tokenizer classes that do not accept it."""
     result = dict(tokenizer_load_kwargs)

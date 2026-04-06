@@ -14,6 +14,7 @@ For this model, prefer:
 
 This keeps tokenization closer to the model card recommendation and avoids fast-tokenizer edge cases.
 The project configs also pin `tokenizer_class: "LlamaTokenizer"` for this route.
+The runtime also needs both `sentencepiece` and `protobuf` installed.
 
 ## Direct Repo-ID Loading
 
