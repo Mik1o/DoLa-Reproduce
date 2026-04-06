@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 
@@ -151,7 +152,18 @@ def _load_tokenizer(
     use_fast = bool(tokenizer_load_kwargs.get("use_fast", True))
 
     if normalized_tokenizer_class == "LlamaTokenizer":
-        return llama_tokenizer_cls.from_pretrained(model_name, **_without_use_fast(tokenizer_load_kwargs))
+        try:
+            return llama_tokenizer_cls.from_pretrained(model_name, **_without_use_fast(tokenizer_load_kwargs))
+        except Exception as error:
+            retried = _retry_openllama_tokenizer_load(
+                model_name=model_name,
+                llama_tokenizer_cls=llama_tokenizer_cls,
+                tokenizer_load_kwargs=tokenizer_load_kwargs,
+                original_error=error,
+            )
+            if retried is not None:
+                return retried
+            raise
 
     try:
         return auto_tokenizer_cls.from_pretrained(model_name, **tokenizer_load_kwargs)
@@ -172,7 +184,15 @@ def _load_tokenizer(
                 model_name,
                 **_without_use_fast(tokenizer_load_kwargs),
             )
-        except Exception:
+        except Exception as llama_error:
+            retried = _retry_openllama_tokenizer_load(
+                model_name=model_name,
+                llama_tokenizer_cls=llama_tokenizer_cls,
+                tokenizer_load_kwargs=tokenizer_load_kwargs,
+                original_error=llama_error,
+            )
+            if retried is not None:
+                return retried
             raise error
 
 

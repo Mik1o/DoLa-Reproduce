@@ -62,3 +62,19 @@ python scripts/hf_probe_early_exit_oracle_parity.py --config configs/openllama7b
 ```
 
 Only after the load / hidden-state / logits path is stable should you reuse the current compare or subset scripts.
+
+## If Repo-ID Loading Still Fails on Tokenizer Parsing
+
+If you still see errors mentioning `tiktoken` or `Error parsing line ... tokenizer.model`,
+that usually means the cached tokenizer files are bad for the current environment.
+In that case, skip repo-id loading and explicitly download a fresh local copy:
+
+```bash
+hf download openlm-research/open_llama_7b_v2 --local-dir /home/yifei/DoLa-Reproduce/models/open_llama_7b_v2
+```
+
+Then keep the config on:
+
+- `use_fast_tokenizer: false`
+- `tokenizer_class: "LlamaTokenizer"`
+- `model_name: "/home/yifei/DoLa-Reproduce/models/open_llama_7b_v2"`
