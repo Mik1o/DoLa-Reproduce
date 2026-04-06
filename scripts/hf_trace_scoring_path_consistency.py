@@ -35,6 +35,13 @@ LOAD_CONFIG_KEYS = (
     "use_fast_tokenizer",
     "trust_remote_code",
     "attn_implementation",
+    "local_files_only",
+    "device_map",
+    "use_4bit",
+    "bnb_4bit_compute_dtype",
+    "bnb_4bit_quant_type",
+    "bnb_4bit_use_double_quant",
+    "tokenizer_class",
 )
 SCORE_TOLERANCE = 1e-6
 JS_TOLERANCE = 1e-6

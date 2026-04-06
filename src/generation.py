@@ -13,6 +13,17 @@ from src.dola_utils import (
 )
 
 
+def _get_model_runtime_device(model: Any) -> Any:
+    """Resolve the device that tokenized scoring inputs should be moved onto."""
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+    try:
+        return next(model.parameters()).device
+    except (AttributeError, StopIteration):
+        return "cpu"
+
+
 @dataclass(slots=True)
 class CandidateScore:
     candidate: str
@@ -35,7 +46,7 @@ def generate_vanilla(
         raise ValueError("prompt must be a non-empty string.")
 
     encoded = tokenizer(prompt, return_tensors="pt")
-    encoded = encoded.to(model.device)
+    encoded = encoded.to(_get_model_runtime_device(model))
     output_ids = model.generate(
         **encoded,
         max_new_tokens=max_new_tokens,
@@ -445,8 +456,9 @@ def _prepare_scoring_inputs(
         prompt_len = int(prompt_batch["input_ids"].shape[1])
         full_len = int(full_batch["input_ids"].shape[1])
         if full_len > prompt_len:
-            input_ids = full_batch["input_ids"].to(model.device)
-            attention_mask = full_batch["attention_mask"].to(model.device)
+            model_device = _get_model_runtime_device(model)
+            input_ids = full_batch["input_ids"].to(model_device)
+            attention_mask = full_batch["attention_mask"].to(model_device)
             return prompt_text, input_ids, attention_mask, prompt_len
 
     raise ValueError(
@@ -520,8 +532,9 @@ def _prepare_scoring_inputs_with_offsets(
     if continuation_token_index is None:
         return None
 
-    input_ids = full_batch["input_ids"].to(model.device)
-    attention_mask = full_batch["attention_mask"].to(model.device)
+    model_device = _get_model_runtime_device(model)
+    input_ids = full_batch["input_ids"].to(model_device)
+    attention_mask = full_batch["attention_mask"].to(model_device)
     return prompt_text, input_ids, attention_mask, continuation_token_index
 
 

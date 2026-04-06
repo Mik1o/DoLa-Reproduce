@@ -281,6 +281,25 @@ For the step-by-step WSL setup order, see `docs/wsl_7b_runbook.md`.
 This is still baseline-prep only: no full TruthfulQA run, no 7B layer sweep,
 and no final formal experiment pipeline yet.
 
+## LLaMA-Family 7B Control Model
+
+The project now also has a minimal control-model path for `openlm-research/open_llama_7b_v2`.
+This does **not** replace the existing Mistral baseline. The goal is still to add one
+open LLaMA-family 7B model that is closer to the official DoLa model family so the
+baseline is easier to defend scientifically.
+
+Recommended first steps:
+
+```bash
+pip install -r requirements-model.txt
+python scripts/hf_smoke_test.py --config configs/openllama7b_v2_truthfulqa_real_smoke_4bit.yaml
+python scripts/hf_probe_early_exit_oracle_parity.py --config configs/openllama7b_v2_truthfulqa_real_probe_oracle_parity.yaml
+```
+
+For this model, prefer `use_fast_tokenizer: false`. For exact `hf download` /
+`huggingface-cli download` examples and local-path setup notes, see
+`docs/openllama7b_v2_prepare.md`.
+
 ## Real TruthfulQA Small Subset
 
 The current 7B compare path can also point at a real `TruthfulQA.csv` file.
