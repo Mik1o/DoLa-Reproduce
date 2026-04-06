@@ -21,8 +21,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mistral-compare", type=Path, required=True)
     parser.add_argument("--mistral-audit", type=Path, required=True)
+    parser.add_argument("--mistral-runs", type=Path, default=None)
     parser.add_argument("--openllama-compare", type=Path, required=True)
     parser.add_argument("--openllama-audit", type=Path, required=True)
+    parser.add_argument("--openllama-runs", type=Path, default=None)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -53,6 +55,84 @@ def _average(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    size = len(ordered)
+    mid = size // 2
+    if size % 2 == 1:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _percentile(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError("Cannot compute a percentile of an empty list.")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * q
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _std(values: list[float]) -> float:
+    mean = _average(values)
+    return (_average([(value - mean) ** 2 for value in values])) ** 0.5
+
+
+def _resolve_runs_path(summary_path: Path, explicit_path: Path | None) -> Path:
+    if explicit_path is not None:
+        return explicit_path
+    return summary_path.with_name("official_parity_runs.json")
+
+
+def _compute_win_tie_loss(
+    dynamic_samples: list[dict[str, object]],
+    static_samples: list[dict[str, object]],
+    metric: str = "mc2",
+    tol: float = 1e-9,
+) -> dict[str, float | int]:
+    if len(dynamic_samples) != len(static_samples):
+        raise ValueError("Dynamic and static sample lists must have the same length.")
+    wins = 0
+    ties = 0
+    losses = 0
+    for dynamic_sample, static_sample in zip(dynamic_samples, static_samples, strict=False):
+        dynamic_value = float(dynamic_sample["dola"]["metrics"][metric])
+        static_value = float(static_sample["dola"]["metrics"][metric])
+        if dynamic_value > static_value + tol:
+            wins += 1
+        elif dynamic_value < static_value - tol:
+            losses += 1
+        else:
+            ties += 1
+    total = len(dynamic_samples)
+    return {
+        "wins": wins,
+        "ties": ties,
+        "losses": losses,
+        "win_rate": wins / total,
+        "tie_rate": ties / total,
+        "loss_rate": losses / total,
+    }
+
+
+def _bucket_sensitivity_stats(cases: list[dict[str, object]]) -> dict[str, float]:
+    deltas = [float(case["bucket_comparison"]["dynamic_score_delta"]) for case in cases]
+    return {
+        "mean": _average(deltas),
+        "mean_abs": _average([abs(value) for value in deltas]),
+        "median": _median(deltas),
+        "std": _std(deltas),
+        "min": min(deltas),
+        "max": max(deltas),
+        "p25": _percentile(deltas, 0.25),
+        "p75": _percentile(deltas, 0.75),
+    }
+
+
 def _layer_dist_top(layer_dist: dict[str, int] | None) -> tuple[str | None, float]:
     if not layer_dist:
         return None, 0.0
@@ -62,7 +142,11 @@ def _layer_dist_top(layer_dist: dict[str, int] | None) -> tuple[str | None, floa
     return top_layer, ratio
 
 
-def _summarize_model(compare_summary: dict[str, object], audit_summary: dict[str, object]) -> dict[str, object]:
+def _summarize_model(
+    compare_summary: dict[str, object],
+    audit_summary: dict[str, object],
+    run_details: dict[str, list[dict[str, object]]],
+) -> dict[str, object]:
     runs = compare_summary["runs"]
     vanilla = runs["vanilla_official"]
     dynamic_current = runs["dynamic_current_bucket"]
@@ -75,12 +159,24 @@ def _summarize_model(compare_summary: dict[str, object], audit_summary: dict[str
     current_margins = [float(case["current_bucket"]["average_top1_top2_margin"]) for case in cases]
     shifted_margins = [float(case["shifted_bucket"]["average_top1_top2_margin"]) for case in cases]
     dynamic_minus_best_static = [float(case["current_bucket"]["dynamic_minus_best_static"]) for case in cases]
-    shifted_dynamic_deltas = [abs(float(case["bucket_comparison"]["dynamic_score_delta"])) for case in cases]
+    shifted_dynamic_deltas = [float(case["bucket_comparison"]["dynamic_score_delta"]) for case in cases]
 
     current_top_layer, current_top_ratio = _layer_dist_top(dynamic_current.get("premature_layer_dist"))
     shifted_top_layer, shifted_top_ratio = _layer_dist_top(
         dynamic_shifted.get("premature_layer_dist") if isinstance(dynamic_shifted, dict) else None
     )
+
+    current_win_tie_loss = _compute_win_tie_loss(
+        run_details["dynamic_current_bucket"],
+        run_details[best_static_name],
+    )
+    shifted_win_tie_loss = None
+    if isinstance(dynamic_shifted, dict):
+        shifted_win_tie_loss = _compute_win_tie_loss(
+            run_details["dynamic_shifted_bucket"],
+            run_details[best_static_name],
+        )
+    bucket_stats = _bucket_sensitivity_stats(cases)
 
     return {
         "model_name": compare_summary["model_name"],
@@ -112,7 +208,10 @@ def _summarize_model(compare_summary: dict[str, object], audit_summary: dict[str
         "avg_current_margin": _average(current_margins),
         "avg_shifted_margin": _average(shifted_margins),
         "avg_dynamic_minus_best_static": _average(dynamic_minus_best_static),
-        "avg_shifted_dynamic_score_delta": _average(shifted_dynamic_deltas),
+        "avg_shifted_dynamic_score_delta": _average([abs(value) for value in shifted_dynamic_deltas]),
+        "current_vs_best_static_win_tie_loss": current_win_tie_loss,
+        "shifted_vs_best_static_win_tie_loss": shifted_win_tie_loss,
+        "bucket_sensitivity_distribution": bucket_stats,
     }
 
 
@@ -123,27 +222,33 @@ def _classify_baseline(mistral: dict[str, object], openllama: dict[str, object])
         and float(mistral["avg_current_dominant_ratio"]) >= 0.8
         and float(openllama["avg_current_dominant_ratio"]) >= 0.8
     )
-    mistral_neighbor_similarity = float(mistral["avg_shifted_dynamic_score_delta"] or 0.0) < 0.01
-    openllama_bucket_sensitive = float(openllama["avg_shifted_dynamic_score_delta"] or 0.0) >= 0.01
+    stable_model_difference = (
+        float(mistral["bucket_sensitivity_distribution"]["mean_abs"]) < 0.5
+        and float(openllama["bucket_sensitivity_distribution"]["mean_abs"]) > 1.0
+    )
+    mostly_ties = (
+        float(mistral["current_vs_best_static_win_tie_loss"]["tie_rate"]) >= 0.7
+        and float(openllama["current_vs_best_static_win_tie_loss"]["tie_rate"]) >= 0.7
+    )
 
-    if both_collapse and mistral_neighbor_similarity and openllama_bucket_sensitive:
+    if both_collapse and stable_model_difference and mostly_ties:
         return (
-            "LIKELY_BASELINE_READY_FOR_ALGO_IMPROVEMENT",
-            "Both models show stable dynamic collapse on the same fixed subset, but they differ in how bucket shifts matter: Mistral looks more like neighbor-layer similarity collapse, while OpenLLaMA is more bucket-sensitive.",
+            "LIKELY_BASELINE_READY_TO_FREEZE",
+            "On the fixed 100-sample subset, both models still collapse toward a near-best static layer, dynamic is mostly a tie against best static, and the Mistral-vs-OpenLLaMA bucket-sensitivity difference remains stable.",
+        )
+    if both_collapse and stable_model_difference:
+        return (
+            "LIKELY_NEED_SUBSET150_CONFIRMATION",
+            "The 100-sample subset already supports the cross-model characterization, but one more larger fixed subset would make the baseline safer to freeze for paper use.",
         )
     if both_collapse:
         return (
-            "LIKELY_NEED_ONE_MORE_LARGER_SUBSET_CHECK",
-            "The fixed subset already reproduces collapse on both models, but the cross-model pattern is not yet clean enough to call fully stable.",
-        )
-    if float(abs(mistral["dynamic_current_minus_best_static_mc2"])) > 0.02 or float(abs(openllama["dynamic_current_minus_best_static_mc2"])) > 0.02:
-        return (
-            "LIKELY_MODEL_SPECIFIC_BEHAVIOR_NOT_YET_STABLE",
-            "At least one model still shows non-trivial dynamic-vs-best-static gaps on the fixed subset, so the characterization is not yet stable enough.",
+            "LIKELY_MODEL_DIFFERENCE_NOT_STABLE_ENOUGH",
+            "Both models still collapse, but the cross-model difference is not cleanly stable enough yet on the fixed 100-sample subset.",
         )
     return (
-        "LIKELY_STILL_TOO_EARLY_TO_CALL_BASELINE_TRUSTWORTHY",
-        "The current cross-model evidence is still too weak or mixed to call the baseline characterization trustworthy.",
+        "LIKELY_STILL_TOO_EARLY_TO_CALL",
+        "The current 100-sample evidence is still too mixed to call the baseline characterization stable.",
     )
 
 
@@ -153,11 +258,13 @@ def main() -> None:
 
     mistral_compare = _load_json(args.mistral_compare)
     mistral_audit = _load_json(args.mistral_audit)
+    mistral_runs = _load_json(_resolve_runs_path(args.mistral_compare, args.mistral_runs))
     openllama_compare = _load_json(args.openllama_compare)
     openllama_audit = _load_json(args.openllama_audit)
+    openllama_runs = _load_json(_resolve_runs_path(args.openllama_compare, args.openllama_runs))
 
-    mistral_summary = _summarize_model(mistral_compare, mistral_audit)
-    openllama_summary = _summarize_model(openllama_compare, openllama_audit)
+    mistral_summary = _summarize_model(mistral_compare, mistral_audit, mistral_runs)
+    openllama_summary = _summarize_model(openllama_compare, openllama_audit, openllama_runs)
     final_label, final_reason = _classify_baseline(mistral_summary, openllama_summary)
 
     report = {
@@ -171,11 +278,17 @@ def main() -> None:
                 float(mistral_summary["avg_current_dominant_ratio"]) >= 0.8
                 and float(openllama_summary["avg_current_dominant_ratio"]) >= 0.8
             ),
-            "mistral_neighbor_layer_similarity_signal": float(mistral_summary["avg_shifted_dynamic_score_delta"]) < 0.01,
-            "openllama_bucket_sensitivity_signal": float(openllama_summary["avg_shifted_dynamic_score_delta"]) >= 0.01,
             "dynamic_gain_over_best_static_mc2": {
                 "mistral": float(mistral_summary["dynamic_current_minus_best_static_mc2"]),
                 "openllama": float(openllama_summary["dynamic_current_minus_best_static_mc2"]),
+            },
+            "current_bucket_tie_rate_vs_best_static": {
+                "mistral": float(mistral_summary["current_vs_best_static_win_tie_loss"]["tie_rate"]),
+                "openllama": float(openllama_summary["current_vs_best_static_win_tie_loss"]["tie_rate"]),
+            },
+            "bucket_sensitivity_mean_abs": {
+                "mistral": float(mistral_summary["bucket_sensitivity_distribution"]["mean_abs"]),
+                "openllama": float(openllama_summary["bucket_sensitivity_distribution"]["mean_abs"]),
             },
         },
         "final_label": final_label,
@@ -192,14 +305,20 @@ def main() -> None:
         f"  vanilla_mc2={mistral_summary['vanilla_mc2']:.4f}, best_static={mistral_summary['best_static_name']} ({mistral_summary['best_static_mc2']:.4f}), dynamic_current={mistral_summary['dynamic_current_mc2']:.4f}, dynamic_shifted={mistral_summary['dynamic_shifted_mc2']:.4f}"
     )
     print(
-        f"  dominant={mistral_summary['current_dominant_layer']} ({mistral_summary['avg_current_dominant_ratio']:.2f}), avg_margin={mistral_summary['avg_current_margin']:.6f}, shifted_delta={mistral_summary['avg_shifted_dynamic_score_delta']:.6f}"
+        f"  dominant={mistral_summary['current_dominant_layer']} ({mistral_summary['avg_current_dominant_ratio']:.2f}), avg_margin={mistral_summary['avg_current_margin']:.6f}, shifted_mean_abs={mistral_summary['bucket_sensitivity_distribution']['mean_abs']:.6f}"
+    )
+    print(
+        f"  current_vs_best_static win/tie/loss={mistral_summary['current_vs_best_static_win_tie_loss']}"
     )
     print("[hf_summarize_cross_model_baseline] OpenLLaMA:")
     print(
         f"  vanilla_mc2={openllama_summary['vanilla_mc2']:.4f}, best_static={openllama_summary['best_static_name']} ({openllama_summary['best_static_mc2']:.4f}), dynamic_current={openllama_summary['dynamic_current_mc2']:.4f}, dynamic_shifted={openllama_summary['dynamic_shifted_mc2']:.4f}"
     )
     print(
-        f"  dominant={openllama_summary['current_dominant_layer']} ({openllama_summary['avg_current_dominant_ratio']:.2f}), avg_margin={openllama_summary['avg_current_margin']:.6f}, shifted_delta={openllama_summary['avg_shifted_dynamic_score_delta']:.6f}"
+        f"  dominant={openllama_summary['current_dominant_layer']} ({openllama_summary['avg_current_dominant_ratio']:.2f}), avg_margin={openllama_summary['avg_current_margin']:.6f}, shifted_mean_abs={openllama_summary['bucket_sensitivity_distribution']['mean_abs']:.6f}"
+    )
+    print(
+        f"  current_vs_best_static win/tie/loss={openllama_summary['current_vs_best_static_win_tie_loss']}"
     )
     print(f"[hf_summarize_cross_model_baseline] final_label={final_label}")
     print(f"[hf_summarize_cross_model_baseline] Saved summary to: {output_path}")

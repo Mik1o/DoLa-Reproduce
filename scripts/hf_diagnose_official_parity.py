@@ -164,10 +164,11 @@ def main() -> None:
     )
 
     run_summaries: dict[str, dict[str, object]] = {}
+    run_sample_results: dict[str, list[dict[str, object]]] = {}
     vanilla_summary: dict[str, object] | None = None
 
     for static_layer in normalized_static_layers:
-        _, compare_summary = evaluate_compare_subset(
+        compare_sample_results, compare_summary = evaluate_compare_subset(
             model,
             tokenizer,
             subset_samples,
@@ -183,13 +184,14 @@ def main() -> None:
         )
         run_name = f"static_{static_layer}"
         run_summaries[run_name] = _extract_dola_summary(compare_summary)
+        run_sample_results[run_name] = compare_sample_results
         if vanilla_summary is None:
             vanilla_summary = _extract_vanilla_summary(compare_summary)
 
     if vanilla_summary is None:
         raise ValueError("At least one static_premature_layer is required for official diagnosis.")
 
-    _, dynamic_current_summary = evaluate_compare_subset(
+    dynamic_current_sample_results, dynamic_current_summary = evaluate_compare_subset(
         model,
         tokenizer,
         subset_samples,
@@ -205,9 +207,10 @@ def main() -> None:
         mature_layer=mature_layer,
     )
     run_summaries["dynamic_current_bucket"] = _extract_dola_summary(dynamic_current_summary)
+    run_sample_results["dynamic_current_bucket"] = dynamic_current_sample_results
 
     if normalized_shifted_bucket:
-        _, dynamic_shifted_summary = evaluate_compare_subset(
+        dynamic_shifted_sample_results, dynamic_shifted_summary = evaluate_compare_subset(
             model,
             tokenizer,
             subset_samples,
@@ -223,6 +226,7 @@ def main() -> None:
             mature_layer=mature_layer,
         )
         run_summaries["dynamic_shifted_bucket"] = _extract_dola_summary(dynamic_shifted_summary)
+        run_sample_results["dynamic_shifted_bucket"] = dynamic_shifted_sample_results
 
     summary = {
         "task_name": str(config.get("task_name", "official_parity_diagnosis")),
@@ -289,7 +293,13 @@ def main() -> None:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
 
+    runs_path = output_dir / "official_parity_runs.json"
+    with runs_path.open("w", encoding="utf-8") as handle:
+        json.dump(run_sample_results, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
     print(f"[hf_diagnose_official_parity] Saved summary to: {output_path}")
+    print(f"[hf_diagnose_official_parity] Saved run details to: {runs_path}")
 
 
 if __name__ == "__main__":
