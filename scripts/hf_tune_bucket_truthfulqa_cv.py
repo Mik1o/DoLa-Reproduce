@@ -1164,6 +1164,9 @@ def main() -> None:
     for fold_spec in fold_specs:
         fold_name = str(fold_spec["name"])
         fold_state = _ensure_fold_state(state, fold_spec)
+        if f"{fold_name}.partial" in state.get("completed_stages", []) and fold_state.get("held_out_test"):
+            logger.log(f"Skipping completed fold: {fold_name} | using saved partial results.")
+            continue
         validation_samples = _subset_from_indices(samples, list(fold_spec["validation_indices"]))
         test_samples = _subset_from_indices(samples, list(fold_spec["test_indices"]))
 
