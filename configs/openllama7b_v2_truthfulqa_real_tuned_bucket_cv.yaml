@@ -1,0 +1,28 @@
+task_name: "openllama7b_v2_truthfulqa_real_tuned_bucket_cv"
+model_name: "/home/yifei/DoLa-Reproduce/models/open_llama_7b_v2"
+device: "cuda"
+torch_dtype: "float16"
+use_fast_tokenizer: false
+tokenizer_class: "LlamaTokenizer"
+trust_remote_code: false
+attn_implementation: "sdpa"
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+split_seed: 20260407
+mature_layer: 31
+dynamic_bucket_candidates:
+  - name: "official_16_32"
+    candidate_premature_layers: [15, 17, 19, 21, 23, 25, 27, 29]
+  - name: "official_14_32"
+    candidate_premature_layers: [13, 15, 17, 19, 21, 23, 25, 27, 29]
+  - name: "official_18_32"
+    candidate_premature_layers: [17, 19, 21, 23, 25, 27, 29]
+  - name: "official_12_32"
+    candidate_premature_layers: [11, 13, 15, 17, 19, 21, 23, 25, 27, 29]
+static_layer_candidates: [15, 17, 19, 21, 23, 25, 27, 29]
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+transfer_reference_summary: "outputs/openllama7b_v2_truthfulqa_real_cross_model_subset100/official_parity_summary.json"
+output_dir: "outputs/openllama7b_v2_truthfulqa_real_tuned_bucket_cv"

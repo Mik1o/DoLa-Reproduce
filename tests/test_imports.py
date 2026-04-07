@@ -18,6 +18,8 @@ SCRIPT_MODULES = [
     "scripts.check_env",
     "scripts.hf_audit_dynamic_collapse",
     "scripts.hf_audit_precision_sensitivity",
+    "scripts.hf_tune_bucket_truthfulqa_cv",
+    "scripts.hf_audit_truthfulqa_mc_kernel",
     "scripts.hf_diagnose_official_parity",
     "scripts.hf_probe_early_exit_oracle_parity",
     "scripts.hf_trace_scoring_path_consistency",
