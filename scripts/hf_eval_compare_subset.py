@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +113,7 @@ def evaluate_compare_subset(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    progress_callback: Callable[[dict[str, object]], None] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float | int | str | dict[str, int] | list[int] | None]]:
     """Evaluate vanilla vs DoLa-style scoring on the first N samples."""
     if max_samples <= 0:
@@ -238,6 +239,15 @@ def evaluate_compare_subset(
                 },
             }
         )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "completed_samples": index + 1,
+                    "total_samples": len(subset),
+                    "sample_index": index,
+                    "question": sample.question,
+                }
+            )
 
     vanilla_summary = aggregate_mc_metrics(vanilla_metric_rows)
     dola_summary = aggregate_mc_metrics(dola_metric_rows)
