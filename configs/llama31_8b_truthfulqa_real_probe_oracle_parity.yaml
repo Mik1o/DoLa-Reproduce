@@ -1,0 +1,20 @@
+task_name: "llama31_8b_truthfulqa_real_probe_oracle_parity"
+model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+model_label: "meta-llama/Llama-3.1-8B (base-assumed local copy)"
+device: "cuda"
+torch_dtype: "bfloat16"
+use_fast_tokenizer: false
+trust_remote_code: false
+attn_implementation: "sdpa"
+local_files_only: true
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+sample_index: 0
+candidate_source: "first_false"
+oracle_premature_layers: [16, 18]
+oracle_mature_layer: 32
+output_dir: "outputs/llama31_8b_truthfulqa_real_probe_oracle_parity"
