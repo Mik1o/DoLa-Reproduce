@@ -96,7 +96,7 @@ class ProgressTracker:
             if samples <= 0:
                 continue
             kind = str(stage["kind"])
-            if kind == "dynamic":
+            if kind in {"dynamic", "shared"}:
                 layer_count = max(int(stage["layer_count"]), 1)
                 dynamic_rates.append(float(duration) / (samples * layer_count))
             elif kind == "static":
@@ -625,7 +625,7 @@ def _classify(cv_average: dict[str, object]) -> str:
 
 
 def _stage_weight(kind: str, samples: int, layer_count: int) -> float:
-    return float(samples * (layer_count if kind == "dynamic" else 1))
+    return float(samples * (layer_count if kind in {"dynamic", "shared"} else 1))
 
 
 def _build_stage_plan(
@@ -634,51 +634,35 @@ def _build_stage_plan(
     static_layers: list[int],
 ) -> list[dict[str, object]]:
     plan: list[dict[str, object]] = []
+    validation_union_layers = sorted(
+        {
+            *static_layers,
+            *(layer for bucket in dynamic_buckets for layer in bucket["candidate_premature_layers"]),
+        }
+    )
+    validation_union_count = max(len(validation_union_layers), 1)
     for fold_spec in fold_specs:
         fold_name = str(fold_spec["name"])
         validation_size = int(fold_spec["validation_size"])
         test_size = int(fold_spec["test_size"])
-        for bucket in dynamic_buckets:
-            layer_count = len(bucket["candidate_premature_layers"])
-            plan.append(
-                {
-                    "id": f"{fold_name}.validation.dynamic.{bucket['name']}",
-                    "label": f"{fold_name} validation dynamic {bucket['name']}",
-                    "kind": "dynamic",
-                    "samples": validation_size,
-                    "layer_count": layer_count,
-                    "weight": _stage_weight("dynamic", validation_size, layer_count),
-                }
-            )
-        for layer in static_layers:
-            plan.append(
-                {
-                    "id": f"{fold_name}.validation.static.{layer}",
-                    "label": f"{fold_name} validation static layer {layer}",
-                    "kind": "static",
-                    "samples": validation_size,
-                    "layer_count": 1,
-                    "weight": _stage_weight("static", validation_size, 1),
-                }
-            )
         plan.append(
             {
-                "id": f"{fold_name}.test.dynamic",
-                "label": f"{fold_name} test tuned dynamic",
-                "kind": "dynamic",
-                "samples": test_size,
-                "layer_count": 1,
-                "weight": _stage_weight("dynamic", test_size, 1),
+                "id": f"{fold_name}.validation.shared",
+                "label": f"{fold_name} validation shared scoring",
+                "kind": "shared",
+                "samples": validation_size,
+                "layer_count": validation_union_count,
+                "weight": _stage_weight("shared", validation_size, validation_union_count),
             }
         )
         plan.append(
             {
-                "id": f"{fold_name}.test.static",
-                "label": f"{fold_name} test tuned static",
-                "kind": "static",
+                "id": f"{fold_name}.test.shared",
+                "label": f"{fold_name} held-out shared scoring",
+                "kind": "shared",
                 "samples": test_size,
                 "layer_count": 1,
-                "weight": _stage_weight("static", test_size, 1),
+                "weight": _stage_weight("shared", test_size, 1),
             }
         )
     return plan
@@ -1230,6 +1214,306 @@ def _run_validation_static_stage(
     return result
 
 
+def _run_validation_shared_stage(
+    *,
+    stage: dict[str, object],
+    tracker: ProgressTracker,
+    logger: RunLogger,
+    state: dict[str, Any],
+    fold_state: dict[str, Any],
+    output_dir: Path,
+    model: Any,
+    tokenizer: Any,
+    validation_sample_ids: list[int],
+    validation_samples: list[TruthfulQASample],
+    dynamic_buckets: list[dict[str, object]],
+    static_layers: list[int],
+    mature_layer: int,
+    prompt_style: str,
+    score_mode: str,
+    post_softmax: bool,
+    relative_top: float,
+    relative_top_value: float,
+    candidate_batch_size: int,
+) -> None:
+    if str(stage["id"]) in state["completed_stages"]:
+        if fold_state["validation_dynamic_candidates"] and fold_state["validation_static_candidates"]:
+            logger.log(f"Skipping completed stage: {stage['label']}")
+            return
+        raise ValueError(f"Completed stage {stage['id']} is missing saved validation results.")
+
+    tracker.start_stage(stage)
+    callback = tracker.make_callback()
+    dynamic_metric_rows = {str(bucket["name"]): [] for bucket in dynamic_buckets}
+    dynamic_layer_usage = {str(bucket["name"]): {} for bucket in dynamic_buckets}
+    static_metric_rows = {str(layer): [] for layer in static_layers}
+    static_layer_usage = {str(layer): {} for layer in static_layers}
+    vanilla_metric_rows: list[dict[str, float]] = []
+    total_answers = 0
+    total_forward_batches = 0
+    dynamic_bucket_map = {
+        str(item["name"]): list(item["candidate_premature_layers"])
+        for item in dynamic_buckets
+    }
+
+    logger.log(
+        f"{fold_state['fold_name']} online reuse note: each validation sample is scored once across the union of "
+        f"{len(dynamic_buckets)} dynamic buckets and {len(static_layers)} static layers; no fold-wide logits cache is kept."
+    )
+
+    for sample_position, sample in enumerate(validation_samples):
+        bundle = _score_sample_multi_config(
+            model=model,
+            tokenizer=tokenizer,
+            sample=sample,
+            prompt_style=prompt_style,
+            score_mode=score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+            mature_layer=mature_layer,
+            static_layers=static_layers,
+            dynamic_buckets=dynamic_bucket_map,
+            candidate_batch_size=candidate_batch_size,
+        )
+        vanilla_metric_rows.append(bundle["vanilla_metrics"])
+        total_answers += int(bundle["profiling"]["answer_count"])
+        total_forward_batches += int(bundle["profiling"]["batch_count"])
+
+        for bucket in dynamic_buckets:
+            bucket_name = str(bucket["name"])
+            dynamic_metric_rows[bucket_name].append(bundle["dynamic_metrics"][bucket_name])
+            sample_usage = bundle["dynamic_layer_usage"].get(bucket_name) or {}
+            aggregate_usage = dynamic_layer_usage[bucket_name]
+            for layer, count in sample_usage.items():
+                aggregate_usage[int(layer)] = aggregate_usage.get(int(layer), 0) + int(count)
+
+        for layer in static_layers:
+            layer_key = str(layer)
+            static_metric_rows[layer_key].append(bundle["static_metrics"][layer_key])
+            sample_usage = bundle["static_layer_usage"].get(layer_key) or {}
+            aggregate_usage = static_layer_usage[layer_key]
+            for used_layer, count in sample_usage.items():
+                aggregate_usage[int(used_layer)] = aggregate_usage.get(int(used_layer), 0) + int(count)
+
+        callback(
+            {
+                "completed_samples": sample_position + 1,
+                "total_samples": len(validation_samples),
+                "sample_index": sample_position,
+                "question": sample.question,
+            }
+        )
+
+    duration = tracker.finish_stage()
+    avg_sample = duration / len(validation_samples)
+    avg_answer = (duration / total_answers) if total_answers else 0.0
+    fold_state["validation_dynamic_candidates"] = {}
+    for bucket in dynamic_buckets:
+        bucket_name = str(bucket["name"])
+        fold_state["validation_dynamic_candidates"][bucket_name] = {
+            "name": bucket_name,
+            "candidate_premature_layers": list(bucket["candidate_premature_layers"]),
+            "summary": _build_candidate_summary(
+                vanilla_metric_rows=vanilla_metric_rows,
+                dola_metric_rows=dynamic_metric_rows[bucket_name],
+                prompt_style=prompt_style,
+                score_mode=score_mode,
+                dola_score_mode="official_dynamic_dola",
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+                premature_layer=int(bucket["candidate_premature_layers"][0]),
+                candidate_premature_layers=list(bucket["candidate_premature_layers"]),
+                mature_layer=mature_layer,
+                layer_usage=dynamic_layer_usage[bucket_name],
+            ),
+            "profiling": {
+                "online_reuse_scope": "sample_union_layers",
+                "cache_hits": 0,
+                "cache_misses": len(validation_samples),
+                "cache_size": 0,
+                "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0,
+                "avg_seconds_per_sample": avg_sample,
+                "avg_seconds_per_answer": avg_answer,
+                "candidate_batch_size": candidate_batch_size,
+                "forward_batches": total_forward_batches,
+            },
+        }
+
+    fold_state["validation_static_candidates"] = {}
+    for layer in static_layers:
+        layer_key = str(layer)
+        fold_state["validation_static_candidates"][layer_key] = {
+            "premature_layer": layer,
+            "summary": _build_candidate_summary(
+                vanilla_metric_rows=vanilla_metric_rows,
+                dola_metric_rows=static_metric_rows[layer_key],
+                prompt_style=prompt_style,
+                score_mode=score_mode,
+                dola_score_mode="official_static_dola",
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+                premature_layer=layer,
+                candidate_premature_layers=None,
+                mature_layer=mature_layer,
+                layer_usage=static_layer_usage[layer_key],
+            ),
+            "profiling": {
+                "online_reuse_scope": "sample_union_layers",
+                "cache_hits": 0,
+                "cache_misses": len(validation_samples),
+                "cache_size": 0,
+                "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0,
+                "avg_seconds_per_sample": avg_sample,
+                "avg_seconds_per_answer": avg_answer,
+                "candidate_batch_size": candidate_batch_size,
+                "forward_batches": total_forward_batches,
+            },
+        }
+
+    _mark_stage_complete(state, stage_id=str(stage["id"]), duration_seconds=duration)
+    fold_state["updated_at"] = _utc_now()
+    _persist_state(output_dir, state, fold_name=str(fold_state["fold_name"]))
+    best_dynamic = _current_best_mc3(fold_state["validation_dynamic_candidates"])
+    best_static = _current_best_mc3(fold_state["validation_static_candidates"])
+    logger.log(
+        f"{fold_state['fold_name']} validation shared profiling: forward_batches={total_forward_batches}, "
+        f"candidate_batch_size={candidate_batch_size}, avg_sample_s={avg_sample:.2f}, avg_answer_s={avg_answer:.4f}"
+    )
+    if best_dynamic is not None:
+        logger.log(f"{fold_state['fold_name']} current best validation dynamic MC3={best_dynamic:.4f}")
+    if best_static is not None:
+        logger.log(f"{fold_state['fold_name']} current best validation static MC3={best_static:.4f}")
+
+
+
+def _run_test_shared_stage(
+    *,
+    stage: dict[str, object],
+    tracker: ProgressTracker,
+    logger: RunLogger,
+    state: dict[str, Any],
+    fold_state: dict[str, Any],
+    output_dir: Path,
+    model: Any,
+    tokenizer: Any,
+    test_samples: list[TruthfulQASample],
+    prompt_style: str,
+    score_mode: str,
+    post_softmax: bool,
+    relative_top: float,
+    relative_top_value: float,
+    mature_layer: int,
+    candidate_batch_size: int,
+) -> None:
+    held_out = fold_state.get("held_out_test")
+    if str(stage["id"]) in state["completed_stages"]:
+        if held_out and {"vanilla", "tuned_dynamic", "tuned_static"}.issubset(held_out):
+            logger.log(f"Skipping completed stage: {stage['label']}")
+            return
+        raise ValueError(f"Completed stage {stage['id']} is missing saved held-out results.")
+
+    selected_dynamic = fold_state.get("selected_dynamic_bucket")
+    selected_static = fold_state.get("selected_static_layer")
+    if selected_dynamic is None or selected_static is None:
+        raise ValueError(f"Cannot run shared held-out test for {fold_state['fold_name']}: selection is incomplete.")
+
+    stage_for_run = dict(stage)
+    selected_union_count = len(set(list(selected_dynamic["candidate_premature_layers"]) + [int(selected_static["premature_layer"])]))
+    stage_for_run["label"] = f"{fold_state['fold_name']} held-out shared scoring"
+    stage_for_run["layer_count"] = max(selected_union_count, 1)
+    stage_for_run["weight"] = _stage_weight("shared", len(test_samples), int(stage_for_run["layer_count"]))
+    tracker.start_stage(stage_for_run)
+    callback = tracker.make_callback()
+
+    selected_dynamic_name = str(selected_dynamic["name"])
+    dynamic_bucket_map = {selected_dynamic_name: list(selected_dynamic["candidate_premature_layers"])}
+    static_layers = [int(selected_static["premature_layer"])]
+    vanilla_metric_rows: list[dict[str, float]] = []
+    dynamic_metric_rows: list[dict[str, float]] = []
+    static_metric_rows: list[dict[str, float]] = []
+    total_answers = 0
+    total_forward_batches = 0
+
+    logger.log(
+        f"{fold_state['fold_name']} online reuse note: each held-out sample is scored once for vanilla, tuned dynamic, and tuned static; no test-cache is kept."
+    )
+
+    for sample_position, sample in enumerate(test_samples):
+        bundle = _score_sample_multi_config(
+            model=model,
+            tokenizer=tokenizer,
+            sample=sample,
+            prompt_style=prompt_style,
+            score_mode=score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+            mature_layer=mature_layer,
+            static_layers=static_layers,
+            dynamic_buckets=dynamic_bucket_map,
+            candidate_batch_size=candidate_batch_size,
+        )
+        vanilla_metric_rows.append(bundle["vanilla_metrics"])
+        dynamic_metric_rows.append(bundle["dynamic_metrics"][selected_dynamic_name])
+        static_metric_rows.append(bundle["static_metrics"][str(selected_static["premature_layer"])])
+        total_answers += int(bundle["profiling"]["answer_count"])
+        total_forward_batches += int(bundle["profiling"]["batch_count"])
+        callback(
+            {
+                "completed_samples": sample_position + 1,
+                "total_samples": len(test_samples),
+                "sample_index": sample_position,
+                "question": sample.question,
+            }
+        )
+
+    duration = tracker.finish_stage()
+    dynamic_summary = _build_candidate_summary(
+        vanilla_metric_rows=vanilla_metric_rows,
+        dola_metric_rows=dynamic_metric_rows,
+        prompt_style=prompt_style,
+        score_mode=score_mode,
+        dola_score_mode="official_dynamic_dola",
+        post_softmax=post_softmax,
+        relative_top=relative_top,
+        relative_top_value=relative_top_value,
+        premature_layer=int(selected_dynamic["candidate_premature_layers"][0]),
+        candidate_premature_layers=list(selected_dynamic["candidate_premature_layers"]),
+        mature_layer=mature_layer,
+        layer_usage=None,
+    )
+    static_summary = aggregate_mc_metrics(static_metric_rows)
+    held_out = held_out or {}
+    held_out["vanilla"] = {
+        "MC1": float(dynamic_summary["vanilla_avg_mc1"]),
+        "MC2": float(dynamic_summary["vanilla_avg_mc2"]),
+        "MC3": float(dynamic_summary["vanilla_avg_mc3"]),
+    }
+    held_out["tuned_dynamic"] = {
+        "MC1": float(dynamic_summary["dola_avg_mc1"]),
+        "MC2": float(dynamic_summary["dola_avg_mc2"]),
+        "MC3": float(dynamic_summary["dola_avg_mc3"]),
+    }
+    held_out["tuned_static"] = {
+        "MC1": float(static_summary["avg_mc1"]),
+        "MC2": float(static_summary["avg_mc2"]),
+        "MC3": float(static_summary["avg_mc3"]),
+    }
+    held_out["num_samples"] = int(dynamic_summary["num_samples"])
+    fold_state["held_out_test"] = held_out
+    _mark_stage_complete(state, stage_id=str(stage["id"]), duration_seconds=duration)
+    _mark_stage_complete(state, stage_id=f"{fold_state['fold_name']}.test.vanilla", duration_seconds=0.0)
+    fold_state["updated_at"] = _utc_now()
+    _persist_state(output_dir, state, fold_name=str(fold_state["fold_name"]))
+    logger.log(
+        f"{fold_state['fold_name']} held-out shared profiling: forward_batches={total_forward_batches}, candidate_batch_size={candidate_batch_size}, "
+        f"avg_sample_s={duration / len(test_samples):.2f}, avg_answer_s={(duration / total_answers) if total_answers else 0.0:.4f}"
+    )
+
+
 def _complete_selection_stage(
     *,
     logger: RunLogger,
@@ -1600,64 +1884,9 @@ def main() -> None:
         test_sample_ids = list(fold_spec["test_indices"])
         validation_samples = _subset_from_indices(samples, validation_sample_ids)
         test_samples = _subset_from_indices(samples, test_sample_ids)
-        validation_cache: dict[int, dict[str, Any]] = {}
-        test_cache: dict[int, dict[str, Any]] = {}
 
-        for bucket in dynamic_buckets:
-            stage_id = f"{fold_name}.validation.dynamic.{bucket['name']}"
-            _run_validation_dynamic_stage(
-                stage=stage_lookup[stage_id],
-                tracker=tracker,
-                logger=logger,
-                state=state,
-                fold_state=fold_state,
-                output_dir=output_dir,
-                model=model,
-                tokenizer=tokenizer,
-                validation_sample_ids=validation_sample_ids,
-                validation_samples=validation_samples,
-                validation_cache=validation_cache,
-                bucket=bucket,
-                all_dynamic_buckets=dynamic_buckets,
-                static_layers=static_layers,
-                mature_layer=mature_layer,
-                prompt_style=prompt_style,
-                score_mode=score_mode,
-                post_softmax=post_softmax,
-                relative_top=relative_top,
-                relative_top_value=relative_top_value,
-                candidate_batch_size=candidate_batch_size,
-            )
-
-        for layer in static_layers:
-            stage_id = f"{fold_name}.validation.static.{layer}"
-            _run_validation_static_stage(
-                stage=stage_lookup[stage_id],
-                tracker=tracker,
-                logger=logger,
-                state=state,
-                fold_state=fold_state,
-                output_dir=output_dir,
-                model=model,
-                tokenizer=tokenizer,
-                validation_sample_ids=validation_sample_ids,
-                validation_samples=validation_samples,
-                validation_cache=validation_cache,
-                layer=layer,
-                all_dynamic_buckets=dynamic_buckets,
-                static_layers=static_layers,
-                mature_layer=mature_layer,
-                prompt_style=prompt_style,
-                score_mode=score_mode,
-                post_softmax=post_softmax,
-                relative_top=relative_top,
-                relative_top_value=relative_top_value,
-                candidate_batch_size=candidate_batch_size,
-            )
-
-        _complete_selection_stage(logger=logger, state=state, fold_state=fold_state, output_dir=output_dir)
-        _run_test_dynamic_stage(
-            stage=stage_lookup[f"{fold_name}.test.dynamic"],
+        _run_validation_shared_stage(
+            stage=stage_lookup[f"{fold_name}.validation.shared"],
             tracker=tracker,
             logger=logger,
             state=state,
@@ -1665,9 +1894,30 @@ def main() -> None:
             output_dir=output_dir,
             model=model,
             tokenizer=tokenizer,
-            test_sample_ids=test_sample_ids,
+            validation_sample_ids=validation_sample_ids,
+            validation_samples=validation_samples,
+            dynamic_buckets=dynamic_buckets,
+            static_layers=static_layers,
+            mature_layer=mature_layer,
+            prompt_style=prompt_style,
+            score_mode=score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+            candidate_batch_size=candidate_batch_size,
+        )
+
+        _complete_selection_stage(logger=logger, state=state, fold_state=fold_state, output_dir=output_dir)
+        _run_test_shared_stage(
+            stage=stage_lookup[f"{fold_name}.test.shared"],
+            tracker=tracker,
+            logger=logger,
+            state=state,
+            fold_state=fold_state,
+            output_dir=output_dir,
+            model=model,
+            tokenizer=tokenizer,
             test_samples=test_samples,
-            test_cache=test_cache,
             prompt_style=prompt_style,
             score_mode=score_mode,
             post_softmax=post_softmax,
@@ -1675,17 +1925,6 @@ def main() -> None:
             relative_top_value=relative_top_value,
             mature_layer=mature_layer,
             candidate_batch_size=candidate_batch_size,
-        )
-        _run_test_static_stage(
-            stage=stage_lookup[f"{fold_name}.test.static"],
-            tracker=tracker,
-            logger=logger,
-            state=state,
-            fold_state=fold_state,
-            output_dir=output_dir,
-            test_sample_ids=test_sample_ids,
-            test_samples=test_samples,
-            test_cache=test_cache,
         )
         _finalize_fold(logger=logger, state=state, fold_state=fold_state, output_dir=output_dir)
 
