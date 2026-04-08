@@ -80,6 +80,7 @@ class ProgressTracker:
         self.current_stage_total_samples = 0
         self.current_stage_layer_count = 1
         self.last_logged_sample = 0
+        self.last_log_time = self.start_time
         self.dynamic_seconds_per_sample_layer: float | None = None
         self.static_seconds_per_sample: float | None = None
         self._bootstrap_rates(stage_durations)
@@ -136,6 +137,7 @@ class ProgressTracker:
         self.current_stage_total_samples = int(stage["samples"])
         self.current_stage_layer_count = max(int(stage["layer_count"]), 1)
         self.last_logged_sample = 0
+        self.last_log_time = time.perf_counter()
         self._write_progress_snapshot(completed_samples=0, eta_seconds=self._estimate_eta(0))
         self.logger.log(
             f"Stage {self.completed_stages + 1}/{self.total_stages} start: {stage['label']} "
@@ -145,14 +147,18 @@ class ProgressTracker:
     def make_callback(self) -> Any:
         def _callback(event: dict[str, object]) -> None:
             completed_samples = int(event["completed_samples"])
+            now = time.perf_counter()
+            sample_stride = 1 if completed_samples <= 5 else 5
             should_log = (
-                completed_samples == 1
+                completed_samples <= 5
                 or completed_samples == self.current_stage_total_samples
-                or completed_samples - self.last_logged_sample >= 25
+                or completed_samples - self.last_logged_sample >= sample_stride
+                or now - self.last_log_time >= 30.0
             )
             if not should_log:
                 return
             self.last_logged_sample = completed_samples
+            self.last_log_time = now
             elapsed = time.perf_counter() - self.start_time
             percent = 100.0 * self._completed_weight_within_stage(completed_samples) / max(self.total_weight, 1.0)
             eta_seconds = self._estimate_eta(completed_samples)
@@ -978,7 +984,20 @@ def _run_validation_dynamic_stage(
         )
         return existing
 
-    tracker.start_stage(stage)
+    stage_for_run = dict(stage)
+    if not validation_cache:
+        total_dynamic_layers = sum(len(list(item["candidate_premature_layers"])) for item in all_dynamic_buckets)
+        stage_for_run["label"] = (
+            f"{fold_state['fold_name']} validation cache warmup via dynamic {bucket_name}"
+        )
+        stage_for_run["layer_count"] = max(total_dynamic_layers + len(static_layers), 1)
+        stage_for_run["weight"] = _stage_weight("dynamic", len(validation_samples), int(stage_for_run["layer_count"]))
+        logger.log(
+            f"{fold_state['fold_name']} cache warmup note: this first validation dynamic stage computes all "
+            f"{len(all_dynamic_buckets)} dynamic buckets and {len(static_layers)} static layers for the fold; "
+            "early ETA is conservative until cache misses stabilize."
+        )
+    tracker.start_stage(stage_for_run)
     callback = tracker.make_callback()
     vanilla_metric_rows: list[dict[str, float]] = []
     dola_metric_rows: list[dict[str, float]] = []
@@ -1278,9 +1297,15 @@ def _run_test_dynamic_stage(
         raise ValueError(f"Cannot run test dynamic for {fold_state['fold_name']}: no selected static layer.")
 
     stage_for_run = dict(stage)
-    stage_for_run["label"] = f"{fold_state['fold_name']} test tuned dynamic {selected_dynamic['name']}"
-    stage_for_run["layer_count"] = len(selected_dynamic["candidate_premature_layers"])
-    stage_for_run["weight"] = _stage_weight("dynamic", len(test_samples), stage_for_run["layer_count"])
+    stage_for_run["label"] = f"{fold_state['fold_name']} test cache warmup via tuned dynamic {selected_dynamic['name']}"
+    effective_layer_factor = len(selected_dynamic["candidate_premature_layers"]) + 1
+    stage_for_run["layer_count"] = effective_layer_factor
+    stage_for_run["weight"] = _stage_weight("dynamic", len(test_samples), effective_layer_factor)
+    if not test_cache:
+        logger.log(
+            f"{fold_state['fold_name']} cache warmup note: this test dynamic stage also prepares held-out vanilla and tuned static reuse; "
+            "early ETA is conservative until cache misses stabilize."
+        )
     tracker.start_stage(stage_for_run)
     callback = tracker.make_callback()
     vanilla_metric_rows: list[dict[str, float]] = []

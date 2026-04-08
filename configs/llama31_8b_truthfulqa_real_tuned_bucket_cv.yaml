@@ -26,5 +26,6 @@ static_layer_candidates: [15, 17]
 post_softmax: false
 relative_top: 0.0
 relative_top_value: -1000.0
+candidate_batch_size: 2
 transfer_reference_summary: "outputs/llama31_8b_truthfulqa_real_subset100_official_compare/official_parity_summary.json"
 output_dir: "outputs/llama31_8b_truthfulqa_real_tuned_bucket_cv"
