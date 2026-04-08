@@ -32,6 +32,15 @@ class CandidateScore:
     premature_layer_dist: dict[int, int] | None = None
 
 
+@dataclass(slots=True)
+class MultiConfigScoreResult:
+    vanilla: list[CandidateScore]
+    static: dict[int, list[CandidateScore]]
+    dynamic: dict[str, list[CandidateScore]]
+    batch_size: int
+    batch_count: int
+
+
 
 def generate_vanilla(
     model: Any,
@@ -275,6 +284,220 @@ def score_candidate_answers_dola_with_details(
         for candidate_answer in candidate_answers
     ]
 
+
+
+def score_candidate_answers_multi_config_with_details(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    candidate_answers: list[str],
+    *,
+    static_layers: list[int],
+    dynamic_buckets: dict[str, list[int]],
+    separator: str = " ",
+    score_mode: str = "sum_logprob",
+    post_softmax: bool = False,
+    relative_top: float = 0.0,
+    relative_top_value: float = -1000.0,
+    mature_layer: int | None = None,
+    candidate_batch_size: int = 1,
+) -> MultiConfigScoreResult:
+    """Score one prompt against many answers while reusing the same forwards.
+
+    This helper keeps scoring semantics identical to the per-answer paths above,
+    but lets higher-level evaluation code batch answers and rescore multiple
+    static/dynamic configurations from one hidden-state pass.
+    """
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    if not candidate_answers:
+        raise ValueError("candidate_answers must contain at least one answer.")
+    if candidate_batch_size <= 0:
+        raise ValueError("candidate_batch_size must be a positive integer.")
+
+    num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
+    resolved_mature_layer = _resolve_mature_layer(mature_layer, num_hidden_layers)
+    resolved_static_layers = validate_candidate_premature_layers(
+        static_layers,
+        resolved_mature_layer,
+        num_hidden_layers,
+    )
+    resolved_dynamic_buckets = {
+        str(name): validate_candidate_premature_layers(
+            layers,
+            resolved_mature_layer,
+            num_hidden_layers,
+        )
+        for name, layers in dynamic_buckets.items()
+    }
+
+    lm_head = model.get_output_embeddings()
+    if lm_head is None:
+        raise ValueError("The model does not expose output embeddings for DoLa-style scoring.")
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    results = MultiConfigScoreResult(
+        vanilla=[],
+        static={layer: [] for layer in resolved_static_layers},
+        dynamic={name: [] for name in resolved_dynamic_buckets},
+        batch_size=candidate_batch_size,
+        batch_count=0,
+    )
+
+    all_needed_layers = sorted(
+        {
+            *resolved_static_layers,
+            *(layer for layers in resolved_dynamic_buckets.values() for layer in layers),
+        }
+    )
+
+    for batch_start in range(0, len(candidate_answers), candidate_batch_size):
+        batch_candidates = candidate_answers[batch_start : batch_start + candidate_batch_size]
+        prepared = [
+            _prepare_scoring_inputs(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=prompt,
+                candidate_answer=candidate_answer,
+                separator=separator,
+            )
+            for candidate_answer in batch_candidates
+        ]
+        batch_input_ids, batch_attention_mask, prompt_lens, valid_lengths = _pad_prepared_batch(
+            prepared,
+            pad_token_id=pad_token_id,
+        )
+
+        with torch.no_grad():
+            outputs = model(
+                input_ids=batch_input_ids,
+                attention_mask=batch_attention_mask,
+                output_hidden_states=True,
+            )
+            hidden_states = outputs.hidden_states
+            if hidden_states is None:
+                raise ValueError("The model did not return hidden_states for multi-config scoring.")
+
+            mature_hidden = hidden_states[resolved_mature_layer + 1]
+            mature_logits = lm_head(mature_hidden[:, :-1, :])
+            vanilla_scores = _gather_token_log_probs(mature_logits, batch_input_ids)
+
+            layer_logits = {
+                layer: lm_head(hidden_states[layer + 1][:, :-1, :])
+                for layer in all_needed_layers
+            }
+            static_scores = {
+                layer: _compute_official_dola_token_scores(
+                    mature_logits=mature_logits,
+                    base_logits=layer_logits[layer],
+                    input_ids=batch_input_ids,
+                    post_softmax=post_softmax,
+                    relative_top=relative_top,
+                    relative_top_value=relative_top_value,
+                )
+                for layer in resolved_static_layers
+            }
+            dynamic_scores: dict[str, Any] = {}
+            dynamic_selected_layers: dict[str, list[list[int]]] = {}
+            for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
+                candidate_logits = torch.stack(
+                    [layer_logits[layer] for layer in candidate_layers],
+                    dim=0,
+                )
+                base_logits, selected_layers = _select_dynamic_base_logits_batched(
+                    mature_logits=mature_logits,
+                    candidate_logits=candidate_logits,
+                    candidate_layers=candidate_layers,
+                )
+                dynamic_scores[bucket_name] = _compute_official_dola_token_scores(
+                    mature_logits=mature_logits,
+                    base_logits=base_logits,
+                    input_ids=batch_input_ids,
+                    post_softmax=post_softmax,
+                    relative_top=relative_top,
+                    relative_top_value=relative_top_value,
+                )
+                dynamic_selected_layers[bucket_name] = selected_layers
+
+        for batch_index, candidate_answer in enumerate(batch_candidates):
+            prompt_len = prompt_lens[batch_index]
+            valid_target_length = max(valid_lengths[batch_index] - 1, 0)
+            continuation_slice = _slice_continuation_scores(
+                token_scores=vanilla_scores[batch_index : batch_index + 1],
+                prompt_len=prompt_len,
+                valid_target_length=valid_target_length,
+            )
+            vanilla_score, continuation_token_count = _aggregate_continuation_log_probs(
+                continuation_log_probs=continuation_slice,
+                score_mode=score_mode,
+            )
+            results.vanilla.append(
+                CandidateScore(
+                    candidate=candidate_answer,
+                    score=vanilla_score,
+                    continuation_token_count=continuation_token_count,
+                )
+            )
+
+            for layer in resolved_static_layers:
+                static_slice = _slice_continuation_scores(
+                    token_scores=static_scores[layer][batch_index : batch_index + 1],
+                    prompt_len=prompt_len,
+                    valid_target_length=valid_target_length,
+                )
+                score, token_count = _aggregate_continuation_log_probs(
+                    continuation_log_probs=static_slice,
+                    score_mode=score_mode,
+                )
+                results.static[layer].append(
+                    CandidateScore(
+                        candidate=candidate_answer,
+                        score=score,
+                        continuation_token_count=token_count,
+                        premature_layer_dist={layer: token_count},
+                    )
+                )
+
+            for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
+                dynamic_slice = _slice_continuation_scores(
+                    token_scores=dynamic_scores[bucket_name][batch_index : batch_index + 1],
+                    prompt_len=prompt_len,
+                    valid_target_length=valid_target_length,
+                )
+                score, token_count = _aggregate_continuation_log_probs(
+                    continuation_log_probs=dynamic_slice,
+                    score_mode=score_mode,
+                )
+                continuation_layers = dynamic_selected_layers[bucket_name][batch_index][
+                    _get_continuation_start_index(prompt_len) : valid_target_length
+                ]
+                results.dynamic[bucket_name].append(
+                    CandidateScore(
+                        candidate=candidate_answer,
+                        score=score,
+                        continuation_token_count=token_count,
+                        premature_layer_dist=_count_premature_layer_usage(
+                            continuation_layers,
+                            candidate_layers,
+                        )
+                        or None,
+                    )
+                )
+
+        results.batch_count += 1
+
+    return results
 
 
 def score_continuation_dola_details(
@@ -633,9 +856,6 @@ def _compute_dynamic_js_divergence(
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
 
-    if mature_logits.shape[0] != 1:
-        raise ValueError("official_dynamic_dola currently expects batch size 1 scoring.")
-
     mature_probs = torch.softmax(mature_logits, dim=-1)
     mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
     candidate_probs = torch.softmax(candidate_logits, dim=-1)
@@ -656,12 +876,12 @@ def _compute_dynamic_js_divergence(
 
 
 
-def _select_dynamic_base_logits(
+def _select_dynamic_base_logits_batched(
     mature_logits: Any,
     candidate_logits: Any,
     candidate_layers: list[int],
-) -> tuple[Any, list[int]]:
-    """Pick one premature layer per token position via JS divergence."""
+) -> tuple[Any, list[list[int]]]:
+    """Pick one premature layer per token position via JS divergence for each batch item."""
     try:
         import torch
     except ImportError as error:
@@ -674,14 +894,37 @@ def _select_dynamic_base_logits(
         mature_logits=mature_logits,
         candidate_logits=candidate_logits,
     )
-    selected_indices = js_divergence.mean(dim=1).argmax(dim=0)
-
-    seq_len = int(mature_logits.shape[1])
-    token_positions = torch.arange(seq_len, device=mature_logits.device)
-    candidate_logits_single = candidate_logits[:, 0, :, :].permute(1, 0, 2)
-    base_logits = candidate_logits_single[token_positions, selected_indices].unsqueeze(0)
-    selected_layers = [candidate_layers[int(index)] for index in selected_indices.tolist()]
+    selected_indices = js_divergence.argmax(dim=0)
+    candidate_logits_by_batch = candidate_logits.permute(1, 2, 0, 3)
+    gather_index = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
+        -1,
+        -1,
+        1,
+        candidate_logits_by_batch.shape[-1],
+    )
+    base_logits = candidate_logits_by_batch.gather(2, gather_index).squeeze(2)
+    selected_layers = [
+        [candidate_layers[int(index)] for index in batch_indices]
+        for batch_indices in selected_indices.tolist()
+    ]
     return base_logits, selected_layers
+
+
+
+def _select_dynamic_base_logits(
+    mature_logits: Any,
+    candidate_logits: Any,
+    candidate_layers: list[int],
+) -> tuple[Any, list[int]]:
+    """Pick one premature layer per token position via JS divergence."""
+    base_logits, selected_layers = _select_dynamic_base_logits_batched(
+        mature_logits=mature_logits,
+        candidate_logits=candidate_logits,
+        candidate_layers=candidate_layers,
+    )
+    if len(selected_layers) != 1:
+        raise ValueError("official_dynamic_dola single-candidate path expects batch size 1 scoring.")
+    return base_logits, selected_layers[0]
 
 
 
@@ -694,6 +937,63 @@ def _count_premature_layer_usage(
     for layer in selected_layers:
         usage[int(layer)] = usage.get(int(layer), 0) + 1
     return {layer: count for layer, count in usage.items() if count > 0}
+
+
+
+def _pad_prepared_batch(
+    prepared: list[tuple[str, Any, Any, int]],
+    *,
+    pad_token_id: int,
+) -> tuple[Any, Any, list[int], list[int]]:
+    """Pad individually prepared scoring inputs into one batch tensor."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    if not prepared:
+        raise ValueError("prepared must contain at least one scoring input.")
+
+    max_length = max(int(input_ids.shape[1]) for _, input_ids, _, _ in prepared)
+    batch_size = len(prepared)
+    device = prepared[0][1].device
+    input_dtype = prepared[0][1].dtype
+    mask_dtype = prepared[0][2].dtype
+    batch_input_ids = torch.full(
+        (batch_size, max_length),
+        int(pad_token_id),
+        dtype=input_dtype,
+        device=device,
+    )
+    batch_attention_mask = torch.zeros(
+        (batch_size, max_length),
+        dtype=mask_dtype,
+        device=device,
+    )
+    prompt_lens: list[int] = []
+    valid_lengths: list[int] = []
+    for batch_index, (_, input_ids, attention_mask, prompt_len) in enumerate(prepared):
+        seq_length = int(input_ids.shape[1])
+        batch_input_ids[batch_index, :seq_length] = input_ids[0]
+        batch_attention_mask[batch_index, :seq_length] = attention_mask[0]
+        prompt_lens.append(int(prompt_len))
+        valid_lengths.append(seq_length)
+    return batch_input_ids, batch_attention_mask, prompt_lens, valid_lengths
+
+
+
+def _slice_continuation_scores(
+    token_scores: Any,
+    *,
+    prompt_len: int,
+    valid_target_length: int,
+) -> Any:
+    """Slice padded token scores down to the scored continuation span."""
+    continuation_start = _get_continuation_start_index(prompt_len)
+    return token_scores[:, continuation_start:valid_target_length]
 
 
 
