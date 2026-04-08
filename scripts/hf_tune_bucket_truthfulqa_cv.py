@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -97,7 +98,32 @@ class ProgressTracker:
         if static_rates:
             self.static_seconds_per_sample = sum(static_rates) / len(static_rates)
 
+    def _reconcile_stage_runtime_shape(self, stage: dict[str, object]) -> dict[str, object]:
+        stage_id = str(stage["id"])
+        planned = self.stage_lookup.get(stage_id)
+        if planned is None:
+            return stage
+        planned_weight = float(planned["weight"])
+        runtime_weight = float(stage["weight"])
+        if math.isclose(planned_weight, runtime_weight, rel_tol=1e-9, abs_tol=1e-9):
+            return stage
+        self.total_weight += runtime_weight - planned_weight
+        planned.update(
+            {
+                "label": stage["label"],
+                "samples": int(stage["samples"]),
+                "layer_count": int(stage["layer_count"]),
+                "weight": runtime_weight,
+            }
+        )
+        for index, item in enumerate(self.stage_plan):
+            if str(item["id"]) == stage_id:
+                self.stage_plan[index] = planned
+                break
+        return planned
+
     def start_stage(self, stage: dict[str, object]) -> None:
+        stage = self._reconcile_stage_runtime_shape(stage)
         self.current_stage = stage
         self.current_stage_start = time.perf_counter()
         self.current_stage_total_samples = int(stage["samples"])
