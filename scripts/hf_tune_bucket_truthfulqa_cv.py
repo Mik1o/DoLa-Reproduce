@@ -177,7 +177,8 @@ class ProgressTracker:
             raise RuntimeError("No active stage to finish.")
         stage_elapsed = time.perf_counter() - self.current_stage_start
         if self.current_stage_total_samples > 0:
-            if str(self.current_stage["kind"]) == "dynamic":
+            current_kind = str(self.current_stage["kind"])
+            if current_kind in {"dynamic", "shared"}:
                 observed = stage_elapsed / (self.current_stage_total_samples * self.current_stage_layer_count)
                 self.dynamic_seconds_per_sample_layer = _ema(self.dynamic_seconds_per_sample_layer, observed)
             else:
@@ -228,7 +229,7 @@ class ProgressTracker:
             return 0.0
         kind = str(stage["kind"])
         layer_count = max(int(stage["layer_count"]), 1)
-        if kind == "dynamic":
+        if kind in {"dynamic", "shared"}:
             if self.dynamic_seconds_per_sample_layer is not None:
                 return samples * layer_count * self.dynamic_seconds_per_sample_layer
             return samples * layer_count * 1.0
