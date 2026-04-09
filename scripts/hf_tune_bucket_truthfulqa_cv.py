@@ -262,6 +262,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--rebuild-summary-only", action="store_true")
     parser.add_argument("--no-resume", action="store_true")
+    parser.add_argument("--profile-first-n", type=int, default=0)
+    parser.add_argument("--profile-batch-sizes", type=str, default="1,2,4")
     return parser.parse_args()
 
 
@@ -287,6 +289,151 @@ def _progress_bar(completed: int, total: int, width: int = 20) -> str:
         return "[" + "-" * width + "]"
     filled = min(width, int(width * completed / total))
     return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+def _parse_profile_batch_sizes(raw: str) -> list[int]:
+    values = [item.strip() for item in raw.split(",") if item.strip()]
+    if not values:
+        raise ValueError("profile batch sizes must contain at least one integer.")
+    batch_sizes = [int(value) for value in values]
+    if any(value <= 0 for value in batch_sizes):
+        raise ValueError("profile batch sizes must be positive integers.")
+    return batch_sizes
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
+def _safe_empty_cuda_cache() -> None:
+    try:
+        import torch
+    except ImportError:
+        return
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _average(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _run_profile_mode(
+    *,
+    logger: RunLogger,
+    output_dir: Path,
+    model: Any,
+    tokenizer: Any,
+    samples: list[TruthfulQASample],
+    prompt_style: str,
+    score_mode: str,
+    post_softmax: bool,
+    relative_top: float,
+    relative_top_value: float,
+    mature_layer: int,
+    dynamic_buckets: list[dict[str, object]],
+    static_layers: list[int],
+    profile_first_n: int,
+    profile_batch_sizes: list[int],
+) -> None:
+    profile_samples = samples[:profile_first_n]
+    dynamic_bucket_map = {
+        str(item["name"]): list(item["candidate_premature_layers"])
+        for item in dynamic_buckets
+    }
+    union_layer_count = len({*static_layers, *(layer for layers in dynamic_bucket_map.values() for layer in layers)})
+    summary: dict[str, Any] = {
+        "profile_first_n": profile_first_n,
+        "num_profile_samples": len(profile_samples),
+        "batch_size_results": [],
+    }
+    logger.log(
+        f"Profiling mode: running first {len(profile_samples)} samples on the real shared-scoring hot path with batch sizes {profile_batch_sizes}."
+    )
+    for batch_size in profile_batch_sizes:
+        profile_path = output_dir / f"sample_profile.batch{batch_size}.jsonl"
+        if profile_path.exists():
+            profile_path.unlink()
+        logger.log(f"Profiling batch size {batch_size} -> {profile_path}")
+        records: list[dict[str, Any]] = []
+        status = "ok"
+        error_message: str | None = None
+        total_wall_start = time.perf_counter()
+        try:
+            for sample_index, sample in enumerate(profile_samples):
+                bundle = _score_sample_multi_config(
+                    model=model,
+                    tokenizer=tokenizer,
+                    sample=sample,
+                    prompt_style=prompt_style,
+                    score_mode=score_mode,
+                    post_softmax=post_softmax,
+                    relative_top=relative_top,
+                    relative_top_value=relative_top_value,
+                    mature_layer=mature_layer,
+                    static_layers=static_layers,
+                    dynamic_buckets=dynamic_bucket_map,
+                    candidate_batch_size=batch_size,
+                )
+                profiling = bundle["profiling"]
+                record = {
+                    "sample_index": sample_index,
+                    "question": sample.question,
+                    "num_candidates": int(profiling["answer_count"]),
+                    "candidate_batch_size": int(profiling["batch_size"]),
+                    "prompt_len": int(profiling["prompt_len"]),
+                    "max_total_len": int(profiling["max_total_len"]),
+                    "union_layer_count": int(profiling["union_layer_count"] or union_layer_count),
+                    "build_prompt_and_candidates_sec": float(profiling["build_prompt_and_candidates_sec"]),
+                    "tokenize_sec": float(profiling["tokenize_sec"]),
+                    "model_forward_sec": float(profiling["model_forward_sec"]),
+                    "dynamic_rescore_sec": float(profiling["dynamic_rescore_sec"]),
+                    "static_rescore_sec": float(profiling["static_rescore_sec"]),
+                    "aggregate_write_sec": float(profiling["aggregate_write_sec"]),
+                    "materialize_sec": float(profiling["materialize_sec"]),
+                    "total_sample_sec": float(profiling["total_sample_sec"]),
+                    "forward_batches": int(profiling["batch_count"]),
+                }
+                records.append(record)
+                _append_jsonl(profile_path, record)
+                logger.log(
+                    f"profile batch={batch_size} sample={sample_index + 1}/{len(profile_samples)} total_sample_s={record['total_sample_sec']:.2f} "
+                    f"forward_s={record['model_forward_sec']:.2f} dynamic_s={record['dynamic_rescore_sec']:.2f} static_s={record['static_rescore_sec']:.2f}"
+                )
+        except RuntimeError as error:
+            status = "runtime_error"
+            error_message = str(error)
+            if "out of memory" in error_message.lower():
+                status = "oom"
+            _safe_empty_cuda_cache()
+            logger.log(f"Profiling batch size {batch_size} failed with {status}: {error_message}")
+        total_wall_time = time.perf_counter() - total_wall_start
+        result = {
+            "candidate_batch_size": batch_size,
+            "status": status,
+            "error": error_message,
+            "num_samples_completed": len(records),
+            "total_wall_time": total_wall_time,
+            "avg_total_sample_sec": _average([float(item["total_sample_sec"]) for item in records]),
+            "avg_build_prompt_and_candidates_sec": _average([float(item["build_prompt_and_candidates_sec"]) for item in records]),
+            "avg_tokenize_sec": _average([float(item["tokenize_sec"]) for item in records]),
+            "avg_model_forward_sec": _average([float(item["model_forward_sec"]) for item in records]),
+            "avg_dynamic_rescore_sec": _average([float(item["dynamic_rescore_sec"]) for item in records]),
+            "avg_static_rescore_sec": _average([float(item["static_rescore_sec"]) for item in records]),
+            "avg_aggregate_write_sec": _average([float(item["aggregate_write_sec"]) for item in records]),
+            "avg_forward_batches": _average([float(item["forward_batches"]) for item in records]),
+            "profile_path": str(profile_path),
+        }
+        summary["batch_size_results"].append(result)
+
+    summary_path = output_dir / "profile_summary.json"
+    _atomic_write_json(summary_path, summary)
+    logger.log(f"Saved real hot-path profiling summary to: {summary_path}")
+
 
 def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
     if not path.exists():
@@ -401,10 +548,14 @@ def _score_sample_multi_config(
     dynamic_buckets: dict[str, list[int]],
     candidate_batch_size: int,
 ) -> dict[str, Any]:
+    sample_start = time.perf_counter()
+    build_start = sample_start
     prompt = build_mc_prompt(sample, prompt_style=prompt_style)
     true_candidates, false_candidates = get_mc_candidate_sets(sample, prompt_style=prompt_style)
     all_candidates = [*true_candidates, *false_candidates]
     num_true = len(true_candidates)
+    build_prompt_and_candidates_sec = time.perf_counter() - build_start
+
     score_result = score_candidate_answers_multi_config_with_details(
         model=model,
         tokenizer=tokenizer,
@@ -420,6 +571,7 @@ def _score_sample_multi_config(
         candidate_batch_size=candidate_batch_size,
     )
 
+    aggregate_start = time.perf_counter()
     vanilla_true = score_result.vanilla[:num_true]
     vanilla_false = score_result.vanilla[num_true:]
     static_metrics = {}
@@ -439,11 +591,16 @@ def _score_sample_multi_config(
         )
         dynamic_usage[bucket_name] = _aggregate_layer_usage(items)
 
+    vanilla_metrics = compute_mc_metrics(
+        [item.score for item in vanilla_true],
+        [item.score for item in vanilla_false],
+    )
+    aggregate_write_sec = time.perf_counter() - aggregate_start
+    scorer_profile = score_result.profile or {}
+    total_sample_sec = time.perf_counter() - sample_start
+
     return {
-        "vanilla_metrics": compute_mc_metrics(
-            [item.score for item in vanilla_true],
-            [item.score for item in vanilla_false],
-        ),
+        "vanilla_metrics": vanilla_metrics,
         "static_metrics": static_metrics,
         "static_layer_usage": static_usage,
         "dynamic_metrics": dynamic_metrics,
@@ -452,6 +609,17 @@ def _score_sample_multi_config(
             "answer_count": len(all_candidates),
             "batch_count": score_result.batch_count,
             "batch_size": score_result.batch_size,
+            "build_prompt_and_candidates_sec": build_prompt_and_candidates_sec,
+            "tokenize_sec": float(scorer_profile.get("tokenize_sec", 0.0)),
+            "model_forward_sec": float(scorer_profile.get("model_forward_sec", 0.0)),
+            "dynamic_rescore_sec": float(scorer_profile.get("dynamic_rescore_sec", 0.0)),
+            "static_rescore_sec": float(scorer_profile.get("static_rescore_sec", 0.0)),
+            "aggregate_write_sec": aggregate_write_sec,
+            "materialize_sec": float(scorer_profile.get("materialize_sec", 0.0)),
+            "total_sample_sec": total_sample_sec,
+            "prompt_len": int(scorer_profile.get("prompt_len", 0)),
+            "max_total_len": int(scorer_profile.get("max_total_len", 0)),
+            "union_layer_count": int(scorer_profile.get("union_layer_count", 0)),
         },
     }
 
@@ -1763,8 +1931,10 @@ def main() -> None:
     logger = RunLogger(output_dir)
     resume_enabled = not args.no_resume
     run_signature = _build_run_signature(config)
+    profile_first_n = int(args.profile_first_n)
+    profile_batch_sizes = _parse_profile_batch_sizes(args.profile_batch_sizes)
 
-    state = _load_json_if_exists(output_dir / STATE_FILE)
+    state = None if profile_first_n > 0 else _load_json_if_exists(output_dir / STATE_FILE)
     if state is not None:
         _validate_state(state, run_signature)
 
@@ -1835,6 +2005,26 @@ def main() -> None:
         num_hidden_layers,
         field_name="static_layer_candidates",
     )
+
+    if profile_first_n > 0:
+        _run_profile_mode(
+            logger=logger,
+            output_dir=output_dir,
+            model=model,
+            tokenizer=tokenizer,
+            samples=samples,
+            prompt_style=prompt_style,
+            score_mode=score_mode,
+            post_softmax=post_softmax,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+            mature_layer=mature_layer,
+            dynamic_buckets=dynamic_buckets,
+            static_layers=static_layers,
+            profile_first_n=profile_first_n,
+            profile_batch_sizes=profile_batch_sizes,
+        )
+        return
 
     fold_a, fold_b, split_meta = _two_fold_split(samples, split_seed)
     fold_specs = [

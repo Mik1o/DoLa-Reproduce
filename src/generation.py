@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,7 @@ class MultiConfigScoreResult:
     dynamic: dict[str, list[CandidateScore]]
     batch_size: int
     batch_count: int
+    profile: dict[str, Any] | None = None
 
 
 
@@ -353,7 +355,15 @@ def score_candidate_answers_multi_config_with_details(
         dynamic={name: [] for name in resolved_dynamic_buckets},
         batch_size=candidate_batch_size,
         batch_count=0,
+        profile=None,
     )
+    tokenize_sec = 0.0
+    model_forward_sec = 0.0
+    static_rescore_sec = 0.0
+    dynamic_rescore_sec = 0.0
+    materialize_sec = 0.0
+    max_prompt_len = 0
+    max_total_len = 0
 
     all_needed_layers = sorted(
         {
@@ -364,6 +374,7 @@ def score_candidate_answers_multi_config_with_details(
 
     for batch_start in range(0, len(candidate_answers), candidate_batch_size):
         batch_candidates = candidate_answers[batch_start : batch_start + candidate_batch_size]
+        tokenize_start = time.perf_counter()
         prepared = [
             _prepare_scoring_inputs(
                 model=model,
@@ -378,13 +389,20 @@ def score_candidate_answers_multi_config_with_details(
             prepared,
             pad_token_id=pad_token_id,
         )
+        tokenize_sec += time.perf_counter() - tokenize_start
+        if prompt_lens:
+            max_prompt_len = max(max_prompt_len, max(int(prompt_len) for prompt_len in prompt_lens))
+        if valid_lengths:
+            max_total_len = max(max_total_len, max(int(length) for length in valid_lengths))
 
         with torch.no_grad():
+            forward_start = time.perf_counter()
             outputs = model(
                 input_ids=batch_input_ids,
                 attention_mask=batch_attention_mask,
                 output_hidden_states=True,
             )
+            model_forward_sec += time.perf_counter() - forward_start
             hidden_states = outputs.hidden_states
             if hidden_states is None:
                 raise ValueError("The model did not return hidden_states for multi-config scoring.")
@@ -397,6 +415,7 @@ def score_candidate_answers_multi_config_with_details(
                 layer: lm_head(hidden_states[layer + 1][:, :-1, :])
                 for layer in all_needed_layers
             }
+            static_start = time.perf_counter()
             static_scores = {
                 layer: _compute_official_dola_token_scores(
                     mature_logits=mature_logits,
@@ -408,8 +427,10 @@ def score_candidate_answers_multi_config_with_details(
                 )
                 for layer in resolved_static_layers
             }
+            static_rescore_sec += time.perf_counter() - static_start
             dynamic_scores: dict[str, Any] = {}
             dynamic_selected_layers: dict[str, list[list[int]]] = {}
+            dynamic_start = time.perf_counter()
             for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
                 candidate_logits = torch.stack(
                     [layer_logits[layer] for layer in candidate_layers],
@@ -429,7 +450,9 @@ def score_candidate_answers_multi_config_with_details(
                     relative_top_value=relative_top_value,
                 )
                 dynamic_selected_layers[bucket_name] = selected_layers
+            dynamic_rescore_sec += time.perf_counter() - dynamic_start
 
+        materialize_start = time.perf_counter()
         for batch_index, candidate_answer in enumerate(batch_candidates):
             prompt_len = prompt_lens[batch_index]
             valid_target_length = max(valid_lengths[batch_index] - 1, 0)
@@ -495,8 +518,21 @@ def score_candidate_answers_multi_config_with_details(
                     )
                 )
 
+        materialize_sec += time.perf_counter() - materialize_start
         results.batch_count += 1
 
+    results.profile = {
+        "tokenize_sec": tokenize_sec,
+        "model_forward_sec": model_forward_sec,
+        "dynamic_rescore_sec": dynamic_rescore_sec,
+        "static_rescore_sec": static_rescore_sec,
+        "materialize_sec": materialize_sec,
+        "num_candidates": len(candidate_answers),
+        "candidate_batch_size": candidate_batch_size,
+        "prompt_len": max_prompt_len,
+        "max_total_len": max_total_len,
+        "union_layer_count": len(all_needed_layers),
+    }
     return results
 
 
