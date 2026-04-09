@@ -409,17 +409,27 @@ def score_candidate_answers_multi_config_with_details(
 
             mature_hidden = hidden_states[resolved_mature_layer + 1]
             mature_logits = lm_head(mature_hidden[:, :-1, :])
-            vanilla_scores = _gather_token_log_probs(mature_logits, batch_input_ids)
+            mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+            mature_probs = mature_log_probs.exp()
+            vanilla_scores = _gather_scores_at_target_ids(mature_log_probs, batch_input_ids)
 
             layer_logits = {
                 layer: lm_head(hidden_states[layer + 1][:, :-1, :])
                 for layer in all_needed_layers
             }
+            layer_log_probs = {
+                layer: torch.log_softmax(logits, dim=-1)
+                for layer, logits in layer_logits.items()
+            }
+            layer_probs = {
+                layer: log_probs.exp()
+                for layer, log_probs in layer_log_probs.items()
+            }
             static_start = time.perf_counter()
             static_scores = {
-                layer: _compute_official_dola_token_scores(
-                    mature_logits=mature_logits,
-                    base_logits=layer_logits[layer],
+                layer: _compute_official_dola_token_scores_from_log_probs(
+                    final_log_probs=mature_log_probs,
+                    base_log_probs=layer_log_probs[layer],
                     input_ids=batch_input_ids,
                     post_softmax=post_softmax,
                     relative_top=relative_top,
@@ -432,24 +442,41 @@ def score_candidate_answers_multi_config_with_details(
             dynamic_selected_layers: dict[str, list[list[int]]] = {}
             dynamic_start = time.perf_counter()
             for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
-                candidate_logits = torch.stack(
-                    [layer_logits[layer] for layer in candidate_layers],
+                candidate_log_probs = torch.stack(
+                    [layer_log_probs[layer] for layer in candidate_layers],
                     dim=0,
                 )
-                base_logits, selected_layers = _select_dynamic_base_logits_batched(
-                    mature_logits=mature_logits,
-                    candidate_logits=candidate_logits,
-                    candidate_layers=candidate_layers,
+                candidate_probs = torch.stack(
+                    [layer_probs[layer] for layer in candidate_layers],
+                    dim=0,
                 )
-                dynamic_scores[bucket_name] = _compute_official_dola_token_scores(
-                    mature_logits=mature_logits,
-                    base_logits=base_logits,
+                js_divergence = _compute_dynamic_js_divergence_from_distributions(
+                    mature_probs=mature_probs,
+                    mature_log_probs=mature_log_probs,
+                    candidate_probs=candidate_probs,
+                    candidate_log_probs=candidate_log_probs,
+                )
+                selected_indices = js_divergence.argmax(dim=0)
+                candidate_log_probs_by_batch = candidate_log_probs.permute(1, 2, 0, 3)
+                gather_index = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
+                    -1,
+                    -1,
+                    1,
+                    candidate_log_probs_by_batch.shape[-1],
+                )
+                base_log_probs = candidate_log_probs_by_batch.gather(2, gather_index).squeeze(2)
+                dynamic_scores[bucket_name] = _compute_official_dola_token_scores_from_log_probs(
+                    final_log_probs=mature_log_probs,
+                    base_log_probs=base_log_probs,
                     input_ids=batch_input_ids,
                     post_softmax=post_softmax,
                     relative_top=relative_top,
                     relative_top_value=relative_top_value,
                 )
-                dynamic_selected_layers[bucket_name] = selected_layers
+                dynamic_selected_layers[bucket_name] = [
+                    [candidate_layers[int(index)] for index in batch_indices]
+                    for batch_indices in selected_indices.tolist()
+                ]
             dynamic_rescore_sec += time.perf_counter() - dynamic_start
 
         materialize_start = time.perf_counter()
@@ -845,6 +872,37 @@ def _gather_scores_at_target_ids(scores: Any, input_ids: Any) -> Any:
 
 
 
+def _compute_official_dola_token_scores_from_log_probs(
+    final_log_probs: Any,
+    base_log_probs: Any,
+    input_ids: Any,
+    post_softmax: bool,
+    relative_top: float,
+    relative_top_value: float,
+) -> Any:
+    """Apply official-style contrastive scoring from precomputed log-probs."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    diff_logits = final_log_probs - base_log_probs
+    if post_softmax:
+        diff_logits = torch.log_softmax(diff_logits, dim=-1)
+    if relative_top > 0.0:
+        diff_logits = _apply_relative_top_mask(
+            diff_logits=diff_logits,
+            final_log_probs=final_log_probs,
+            relative_top=relative_top,
+            relative_top_value=relative_top_value,
+        )
+    return _gather_scores_at_target_ids(diff_logits, input_ids)
+
+
+
 def _compute_official_dola_token_scores(
     mature_logits: Any,
     base_logits: Any,
@@ -864,38 +922,31 @@ def _compute_official_dola_token_scores(
 
     final_log_probs = torch.log_softmax(mature_logits, dim=-1)
     base_log_probs = torch.log_softmax(base_logits, dim=-1)
-    diff_logits = final_log_probs - base_log_probs
-    if post_softmax:
-        diff_logits = torch.log_softmax(diff_logits, dim=-1)
-    if relative_top > 0.0:
-        diff_logits = _apply_relative_top_mask(
-            diff_logits=diff_logits,
-            final_log_probs=final_log_probs,
-            relative_top=relative_top,
-            relative_top_value=relative_top_value,
-        )
-    return _gather_scores_at_target_ids(diff_logits, input_ids)
+    return _compute_official_dola_token_scores_from_log_probs(
+        final_log_probs=final_log_probs,
+        base_log_probs=base_log_probs,
+        input_ids=input_ids,
+        post_softmax=post_softmax,
+        relative_top=relative_top,
+        relative_top_value=relative_top_value,
+    )
 
 
 
-def _compute_dynamic_js_divergence(
-    mature_logits: Any,
-    candidate_logits: Any,
+def _compute_dynamic_js_divergence_from_distributions(
+    mature_probs: Any,
+    mature_log_probs: Any,
+    candidate_probs: Any,
+    candidate_log_probs: Any,
 ) -> Any:
-    """Compute per-layer, per-token JS divergence for official dynamic DoLa."""
+    """Compute per-layer, per-token JS divergence from precomputed distributions."""
     try:
-        import torch
         import torch.nn.functional as F
     except ImportError as error:
         raise ImportError(
             "torch is required for DoLa-style candidate scoring. "
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
-
-    mature_probs = torch.softmax(mature_logits, dim=-1)
-    mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
-    candidate_probs = torch.softmax(candidate_logits, dim=-1)
-    candidate_log_probs = torch.log_softmax(candidate_logits, dim=-1)
 
     mixture = 0.5 * (mature_probs.unsqueeze(0) + candidate_probs)
     kl_mature = F.kl_div(
@@ -909,6 +960,32 @@ def _compute_dynamic_js_divergence(
         reduction="none",
     ).mean(dim=-1)
     return 0.5 * (kl_mature + kl_candidate)
+
+
+
+def _compute_dynamic_js_divergence(
+    mature_logits: Any,
+    candidate_logits: Any,
+) -> Any:
+    """Compute per-layer, per-token JS divergence for official dynamic DoLa."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    mature_probs = torch.softmax(mature_logits, dim=-1)
+    mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+    candidate_probs = torch.softmax(candidate_logits, dim=-1)
+    candidate_log_probs = torch.log_softmax(candidate_logits, dim=-1)
+    return _compute_dynamic_js_divergence_from_distributions(
+        mature_probs=mature_probs,
+        mature_log_probs=mature_log_probs,
+        candidate_probs=candidate_probs,
+        candidate_log_probs=candidate_log_probs,
+    )
 
 
 
