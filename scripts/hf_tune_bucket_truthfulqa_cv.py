@@ -35,6 +35,9 @@ STATE_FILE = "cv_state.json"
 PROGRESS_FILE = "truthfulqa_tuned_bucket_cv_progress.json"
 SUMMARY_FILE = "truthfulqa_tuned_bucket_cv_summary.json"
 LEGACY_PARTIAL_FILE = "truthfulqa_tuned_bucket_cv_partial.json"
+STAGE_PROFILE_FILE = "stage_profile.jsonl"
+STAGE_PROFILE_SUMMARY_FILE = "stage_profile_summary.json"
+ETA_WARMUP_SAMPLES = 8
 
 
 class RunLogger:
@@ -83,11 +86,13 @@ class ProgressTracker:
         self.last_log_time = self.start_time
         self.dynamic_seconds_per_sample_layer: float | None = None
         self.static_seconds_per_sample: float | None = None
+        self.stage_seconds_per_sample_by_family: dict[str, float] = {}
         self._bootstrap_rates(stage_durations)
 
     def _bootstrap_rates(self, stage_durations: dict[str, float]) -> None:
         dynamic_rates: list[float] = []
         static_rates: list[float] = []
+        family_rates: dict[str, list[float]] = {}
         for stage_id, duration in stage_durations.items():
             stage = self.stage_lookup.get(stage_id)
             if stage is None:
@@ -95,12 +100,19 @@ class ProgressTracker:
             samples = int(stage["samples"])
             if samples <= 0:
                 continue
+            family = _infer_stage_rate_family(stage)
+            family_rates.setdefault(family, []).append(float(duration) / samples)
             kind = str(stage["kind"])
             if kind in {"dynamic", "shared"}:
                 layer_count = max(int(stage["layer_count"]), 1)
                 dynamic_rates.append(float(duration) / (samples * layer_count))
             elif kind == "static":
                 static_rates.append(float(duration) / samples)
+        self.stage_seconds_per_sample_by_family = {
+            family: sum(values) / len(values)
+            for family, values in family_rates.items()
+            if values
+        }
         if dynamic_rates:
             self.dynamic_seconds_per_sample_layer = sum(dynamic_rates) / len(dynamic_rates)
         if static_rates:
@@ -138,7 +150,13 @@ class ProgressTracker:
         self.current_stage_layer_count = max(int(stage["layer_count"]), 1)
         self.last_logged_sample = 0
         self.last_log_time = time.perf_counter()
-        self._write_progress_snapshot(completed_samples=0, eta_seconds=self._estimate_eta(0))
+        stage_eta_seconds = self._estimate_current_stage_remaining_seconds(0)
+        total_eta_seconds = self._estimate_eta(0, stage_eta_seconds=stage_eta_seconds)
+        self._write_progress_snapshot(
+            completed_samples=0,
+            stage_eta_seconds=stage_eta_seconds,
+            total_eta_seconds=total_eta_seconds,
+        )
         self.logger.log(
             f"Stage {self.completed_stages + 1}/{self.total_stages} start: {stage['label']} "
             f"| samples={self.current_stage_total_samples} | layer_factor={self.current_stage_layer_count}"
@@ -161,14 +179,21 @@ class ProgressTracker:
             self.last_log_time = now
             elapsed = time.perf_counter() - self.start_time
             percent = 100.0 * self._completed_weight_within_stage(completed_samples) / max(self.total_weight, 1.0)
-            eta_seconds = self._estimate_eta(completed_samples)
+            stage_eta_seconds = self._estimate_current_stage_remaining_seconds(completed_samples)
+            total_eta_seconds = self._estimate_eta(completed_samples, stage_eta_seconds=stage_eta_seconds)
             stage_bar = _progress_bar(completed_samples, self.current_stage_total_samples)
             self.logger.log(
                 f"{stage_bar} {percent:5.1f}% | {self.current_stage['label']} "
                 f"| {completed_samples}/{self.current_stage_total_samples} samples "
-                f"| elapsed={_format_seconds(elapsed)} | eta={_format_seconds(eta_seconds)}"
+                f"| elapsed={_format_seconds(elapsed)} "
+                f"| stage_eta={_format_seconds(stage_eta_seconds)} "
+                f"| total_eta={_format_seconds(total_eta_seconds)}"
             )
-            self._write_progress_snapshot(completed_samples=completed_samples, eta_seconds=eta_seconds)
+            self._write_progress_snapshot(
+                completed_samples=completed_samples,
+                stage_eta_seconds=stage_eta_seconds,
+                total_eta_seconds=total_eta_seconds,
+            )
 
         return _callback
 
@@ -177,13 +202,18 @@ class ProgressTracker:
             raise RuntimeError("No active stage to finish.")
         stage_elapsed = time.perf_counter() - self.current_stage_start
         if self.current_stage_total_samples > 0:
+            observed_seconds_per_sample = stage_elapsed / self.current_stage_total_samples
+            family = _infer_stage_rate_family(self.current_stage)
+            self.stage_seconds_per_sample_by_family[family] = _ema(
+                self.stage_seconds_per_sample_by_family.get(family),
+                observed_seconds_per_sample,
+            )
             current_kind = str(self.current_stage["kind"])
             if current_kind in {"dynamic", "shared"}:
                 observed = stage_elapsed / (self.current_stage_total_samples * self.current_stage_layer_count)
                 self.dynamic_seconds_per_sample_layer = _ema(self.dynamic_seconds_per_sample_layer, observed)
             else:
-                observed = stage_elapsed / self.current_stage_total_samples
-                self.static_seconds_per_sample = _ema(self.static_seconds_per_sample, observed)
+                self.static_seconds_per_sample = _ema(self.static_seconds_per_sample, observed_seconds_per_sample)
         self.completed_stage_ids.add(str(self.current_stage["id"]))
         self.completed_weight += float(self.current_stage["weight"])
         self.completed_stages += 1
@@ -193,7 +223,8 @@ class ProgressTracker:
         )
         self._write_progress_snapshot(
             completed_samples=self.current_stage_total_samples,
-            eta_seconds=self._estimate_eta(self.current_stage_total_samples),
+            stage_eta_seconds=0.0,
+            total_eta_seconds=self._estimate_eta(self.current_stage_total_samples, stage_eta_seconds=0.0),
         )
         self.current_stage = None
         return stage_elapsed
@@ -204,12 +235,29 @@ class ProgressTracker:
         fraction = min(max(completed_samples / self.current_stage_total_samples, 0.0), 1.0)
         return self.completed_weight + float(self.current_stage["weight"]) * fraction
 
-    def _estimate_eta(self, completed_samples: int) -> float:
-        remaining_current = 0.0
-        if self.current_stage is not None and 0 < completed_samples < self.current_stage_total_samples:
-            current_elapsed = time.perf_counter() - self.current_stage_start
-            seconds_per_sample = current_elapsed / completed_samples
-            remaining_current = seconds_per_sample * (self.current_stage_total_samples - completed_samples)
+    def _estimate_current_stage_remaining_seconds(self, completed_samples: int) -> float:
+        if self.current_stage is None or self.current_stage_total_samples <= 0:
+            return 0.0
+        if completed_samples >= self.current_stage_total_samples:
+            return 0.0
+        remaining_samples = self.current_stage_total_samples - completed_samples
+        prior_stage_seconds = self._estimate_stage_seconds(self.current_stage)
+        prior_seconds_per_sample: float | None = None
+        if prior_stage_seconds > 0.0:
+            prior_seconds_per_sample = prior_stage_seconds / self.current_stage_total_samples
+        if completed_samples <= 0:
+            return remaining_samples * (prior_seconds_per_sample or 0.0)
+        observed_seconds_per_sample = (time.perf_counter() - self.current_stage_start) / completed_samples
+        blended_seconds_per_sample = _blend_eta_seconds_per_sample(
+            prior_seconds_per_sample=prior_seconds_per_sample,
+            observed_seconds_per_sample=observed_seconds_per_sample,
+            completed_samples=completed_samples,
+        )
+        return remaining_samples * blended_seconds_per_sample
+
+    def _estimate_eta(self, completed_samples: int, *, stage_eta_seconds: float | None = None) -> float:
+        if stage_eta_seconds is None:
+            stage_eta_seconds = self._estimate_current_stage_remaining_seconds(completed_samples)
 
         current_index = -1
         if self.current_stage is not None:
@@ -221,12 +269,16 @@ class ProgressTracker:
             if str(stage["id"]) in self.completed_stage_ids:
                 continue
             remaining_future += self._estimate_stage_seconds(stage)
-        return max(remaining_current + remaining_future, 0.0)
+        return max(stage_eta_seconds + remaining_future, 0.0)
 
     def _estimate_stage_seconds(self, stage: dict[str, object]) -> float:
         samples = int(stage["samples"])
         if samples <= 0:
             return 0.0
+        family = _infer_stage_rate_family(stage)
+        family_rate = self.stage_seconds_per_sample_by_family.get(family)
+        if family_rate is not None:
+            return samples * family_rate
         kind = str(stage["kind"])
         layer_count = max(int(stage["layer_count"]), 1)
         if kind in {"dynamic", "shared"}:
@@ -237,21 +289,34 @@ class ProgressTracker:
             return samples * self.static_seconds_per_sample
         return samples * 1.0
 
-    def _write_progress_snapshot(self, *, completed_samples: int, eta_seconds: float) -> None:
+    def _write_progress_snapshot(
+        self,
+        *,
+        completed_samples: int,
+        stage_eta_seconds: float,
+        total_eta_seconds: float,
+    ) -> None:
         snapshot = {
             "completed_stages": self.completed_stages,
             "total_stages": self.total_stages,
             "current_stage": None if self.current_stage is None else self.current_stage["label"],
             "current_stage_kind": None if self.current_stage is None else self.current_stage["kind"],
+            "current_stage_rate_family": None if self.current_stage is None else _infer_stage_rate_family(self.current_stage),
             "current_stage_completed_samples": completed_samples,
             "current_stage_total_samples": self.current_stage_total_samples,
             "elapsed_seconds": time.perf_counter() - self.start_time,
-            "eta_seconds": eta_seconds,
-            "eta_method": "empirical_stage_rate_resume_safe",
+            "stage_eta_seconds": stage_eta_seconds,
+            "eta_seconds": total_eta_seconds,
+            "total_eta_seconds": total_eta_seconds,
+            "eta_method": "blended_stage_family_resume_safe",
             "completed_weight": self._completed_weight_within_stage(completed_samples),
             "total_weight": self.total_weight,
             "dynamic_seconds_per_sample_layer": self.dynamic_seconds_per_sample_layer,
             "static_seconds_per_sample": self.static_seconds_per_sample,
+            "stage_seconds_per_sample_by_family": {
+                key: float(value)
+                for key, value in sorted(self.stage_seconds_per_sample_by_family.items())
+            },
         }
         _atomic_write_json(self.output_dir / PROGRESS_FILE, snapshot)
 
@@ -291,6 +356,38 @@ def _progress_bar(completed: int, total: int, width: int = 20) -> str:
     filled = min(width, int(width * completed / total))
     return "[" + "#" * filled + "-" * (width - filled) + "]"
 
+
+def _infer_stage_rate_family(stage: dict[str, object]) -> str:
+    stage_id = str(stage.get("id", ""))
+    label = str(stage.get("label", "")).lower()
+    kind = str(stage.get("kind", ""))
+    if ".validation.shared" in stage_id or "validation shared" in label:
+        return "validation_shared"
+    if ".test.shared" in stage_id or "held-out shared" in label:
+        return "test_shared"
+    if ".validation.dynamic." in stage_id:
+        return "validation_dynamic"
+    if ".validation.static." in stage_id:
+        return "validation_static"
+    if kind in {"shared", "dynamic", "static"}:
+        return kind
+    return "generic"
+
+
+def _blend_eta_seconds_per_sample(
+    *,
+    prior_seconds_per_sample: float | None,
+    observed_seconds_per_sample: float,
+    completed_samples: int,
+    warmup_samples: int = ETA_WARMUP_SAMPLES,
+) -> float:
+    if prior_seconds_per_sample is None or prior_seconds_per_sample <= 0.0:
+        return observed_seconds_per_sample
+    if completed_samples <= 0 or warmup_samples <= 0:
+        return observed_seconds_per_sample
+    observed_weight = min(max(completed_samples / warmup_samples, 0.0), 1.0)
+    return ((1.0 - observed_weight) * prior_seconds_per_sample) + (observed_weight * observed_seconds_per_sample)
+
 def _parse_profile_batch_sizes(raw: str) -> list[int]:
     values = [item.strip() for item in raw.split(",") if item.strip()]
     if not values:
@@ -306,6 +403,178 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         handle.flush()
+
+
+def _write_jsonl_records(path: Path, records: list[dict[str, Any]]) -> None:
+    if path.exists():
+        path.unlink()
+    for record in records:
+        _append_jsonl(path, record)
+
+
+
+def _merge_layer_usage_counts(
+    aggregate_usage: dict[int, int],
+    sample_usage: dict[str, int] | dict[int, int] | None,
+) -> None:
+    if not sample_usage:
+        return
+    for layer, count in sample_usage.items():
+        aggregate_usage[int(layer)] = aggregate_usage.get(int(layer), 0) + int(count)
+
+
+
+def _build_inner_sample_profile_record(
+    *,
+    sample_index: int,
+    sample: TruthfulQASample,
+    profiling: dict[str, Any],
+    union_layer_count: int,
+) -> dict[str, Any]:
+    return {
+        "sample_index": sample_index,
+        "question": sample.question,
+        "num_candidates": int(profiling["answer_count"]),
+        "candidate_batch_size": int(profiling["batch_size"]),
+        "prompt_len": int(profiling["prompt_len"]),
+        "max_total_len": int(profiling["max_total_len"]),
+        "union_layer_count": int(profiling["union_layer_count"] or union_layer_count),
+        "build_prompt_and_candidates_sec": float(profiling["build_prompt_and_candidates_sec"]),
+        "tokenize_sec": float(profiling["tokenize_sec"]),
+        "model_forward_sec": float(profiling["model_forward_sec"]),
+        "dynamic_rescore_sec": float(profiling["dynamic_rescore_sec"]),
+        "static_rescore_sec": float(profiling["static_rescore_sec"]),
+        "aggregate_write_sec": float(profiling["aggregate_write_sec"]),
+        "materialize_sec": float(profiling["materialize_sec"]),
+        "total_sample_sec": float(profiling["total_sample_sec"]),
+        "forward_batches": int(profiling["batch_count"]),
+    }
+
+
+
+def _build_stage_sample_profile_record(
+    *,
+    sample_index: int,
+    sample: TruthfulQASample,
+    bundle: dict[str, Any],
+    inner_score_sample_sec: float,
+    metrics_aggregation_sec: float,
+    usage_merge_sec: float,
+    progress_callback_sec: float,
+) -> dict[str, Any]:
+    profiling = bundle["profiling"]
+    total_stage_sample_sec = (
+        inner_score_sample_sec
+        + metrics_aggregation_sec
+        + usage_merge_sec
+        + progress_callback_sec
+    )
+    return {
+        "sample_index": sample_index,
+        "question": sample.question,
+        "answer_count": int(profiling["answer_count"]),
+        "batch_count": int(profiling["batch_count"]),
+        "prompt_len": int(profiling["prompt_len"]),
+        "max_total_len": int(profiling["max_total_len"]),
+        "inner_score_sample_sec": float(inner_score_sample_sec),
+        "metrics_aggregation_sec": float(metrics_aggregation_sec),
+        "usage_merge_sec": float(usage_merge_sec),
+        "progress_callback_sec": float(progress_callback_sec),
+        "state_persist_sec": 0.0,
+        "total_stage_sample_sec": float(total_stage_sample_sec),
+        "build_prompt_and_candidates_sec": float(profiling["build_prompt_and_candidates_sec"]),
+        "tokenize_sec": float(profiling["tokenize_sec"]),
+        "model_forward_sec": float(profiling["model_forward_sec"]),
+        "dynamic_rescore_sec": float(profiling["dynamic_rescore_sec"]),
+        "static_rescore_sec": float(profiling["static_rescore_sec"]),
+        "materialize_sec": float(profiling["materialize_sec"]),
+    }
+
+
+
+def _summarize_inner_profile_records(
+    records: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    sample_profile_path: Path,
+) -> dict[str, Any]:
+    return {
+        "candidate_batch_size": batch_size,
+        "num_samples_completed": len(records),
+        "avg_total_sample_sec": _average([float(item["total_sample_sec"]) for item in records]),
+        "avg_build_prompt_and_candidates_sec": _average([float(item["build_prompt_and_candidates_sec"]) for item in records]),
+        "avg_tokenize_sec": _average([float(item["tokenize_sec"]) for item in records]),
+        "avg_model_forward_sec": _average([float(item["model_forward_sec"]) for item in records]),
+        "avg_dynamic_rescore_sec": _average([float(item["dynamic_rescore_sec"]) for item in records]),
+        "avg_static_rescore_sec": _average([float(item["static_rescore_sec"]) for item in records]),
+        "avg_aggregate_write_sec": _average([float(item["aggregate_write_sec"]) for item in records]),
+        "avg_forward_batches": _average([float(item["forward_batches"]) for item in records]),
+        "sample_profile_path": str(sample_profile_path),
+    }
+
+
+
+def _summarize_stage_profile_records(
+    records: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    stage_profile_path: Path,
+) -> dict[str, Any]:
+    return {
+        "candidate_batch_size": batch_size,
+        "num_samples_completed": len(records),
+        "avg_inner_score_sample_sec": _average([float(item["inner_score_sample_sec"]) for item in records]),
+        "avg_metrics_aggregation_sec": _average([float(item["metrics_aggregation_sec"]) for item in records]),
+        "avg_usage_merge_sec": _average([float(item["usage_merge_sec"]) for item in records]),
+        "avg_progress_callback_sec": _average([float(item["progress_callback_sec"]) for item in records]),
+        "avg_state_persist_sec": _average([float(item["state_persist_sec"]) for item in records]),
+        "avg_total_stage_sample_sec": _average([float(item["total_stage_sample_sec"]) for item in records]),
+        "avg_answer_count": _average([float(item["answer_count"]) for item in records]),
+        "avg_batch_count": _average([float(item["batch_count"]) for item in records]),
+        "avg_prompt_len": _average([float(item["prompt_len"]) for item in records]),
+        "avg_max_total_len": _average([float(item["max_total_len"]) for item in records]),
+        "stage_profile_path": str(stage_profile_path),
+    }
+
+
+
+def _consume_validation_shared_bundle(
+    *,
+    bundle: dict[str, Any],
+    dynamic_buckets: list[dict[str, object]],
+    static_layers: list[int],
+    vanilla_metric_rows: list[dict[str, float]],
+    dynamic_metric_rows: dict[str, list[dict[str, float]]],
+    dynamic_layer_usage: dict[str, dict[int, int]],
+    static_metric_rows: dict[str, list[dict[str, float]]],
+    static_layer_usage: dict[str, dict[int, int]],
+) -> dict[str, float | int]:
+    metrics_start = time.perf_counter()
+    vanilla_metric_rows.append(bundle["vanilla_metrics"])
+    for bucket in dynamic_buckets:
+        bucket_name = str(bucket["name"])
+        dynamic_metric_rows[bucket_name].append(bundle["dynamic_metrics"][bucket_name])
+    for layer in static_layers:
+        layer_key = str(layer)
+        static_metric_rows[layer_key].append(bundle["static_metrics"][layer_key])
+    metrics_aggregation_sec = time.perf_counter() - metrics_start
+
+    usage_start = time.perf_counter()
+    for bucket in dynamic_buckets:
+        bucket_name = str(bucket["name"])
+        _merge_layer_usage_counts(dynamic_layer_usage[bucket_name], bundle["dynamic_layer_usage"].get(bucket_name) or {})
+    for layer in static_layers:
+        layer_key = str(layer)
+        _merge_layer_usage_counts(static_layer_usage[layer_key], bundle["static_layer_usage"].get(layer_key) or {})
+    usage_merge_sec = time.perf_counter() - usage_start
+    profiling = bundle["profiling"]
+    return {
+        "metrics_aggregation_sec": metrics_aggregation_sec,
+        "usage_merge_sec": usage_merge_sec,
+        "answer_count": int(profiling["answer_count"]),
+        "batch_count": int(profiling["batch_count"]),
+    }
+
 
 
 def _safe_empty_cuda_cache() -> None:
@@ -342,69 +611,78 @@ def _run_profile_mode(
     profile_batch_sizes: list[int],
 ) -> None:
     profile_samples = samples[:profile_first_n]
-    dynamic_bucket_map = {
-        str(item["name"]): list(item["candidate_premature_layers"])
-        for item in dynamic_buckets
-    }
-    union_layer_count = len({*static_layers, *(layer for layers in dynamic_bucket_map.values() for layer in layers)})
-    summary: dict[str, Any] = {
-        "profile_first_n": profile_first_n,
-        "num_profile_samples": len(profile_samples),
-        "batch_size_results": [],
-    }
-    logger.log(
-        f"Profiling mode: running first {len(profile_samples)} samples on the real shared-scoring hot path with batch sizes {profile_batch_sizes}."
-    )
+    union_layer_count = len({*static_layers, *(layer for item in dynamic_buckets for layer in item["candidate_premature_layers"])})
+    summary: dict[str, Any] = {"profile_first_n": profile_first_n, "num_profile_samples": len(profile_samples), "batch_size_results": []}
+    logger.log(f"Profiling mode: running first {len(profile_samples)} validation-stage samples on the real shared-scoring path with batch sizes {profile_batch_sizes}.")
+    multi_batch = len(profile_batch_sizes) > 1
     for batch_size in profile_batch_sizes:
-        profile_path = output_dir / f"sample_profile.batch{batch_size}.jsonl"
-        if profile_path.exists():
-            profile_path.unlink()
-        logger.log(f"Profiling batch size {batch_size} -> {profile_path}")
-        records: list[dict[str, Any]] = []
+        sample_profile_path = output_dir / f"sample_profile.batch{batch_size}.jsonl"
+        stage_profile_path = output_dir / (f"stage_profile.batch{batch_size}.jsonl" if multi_batch else STAGE_PROFILE_FILE)
+        stage_profile_summary_path = output_dir / (f"stage_profile_summary.batch{batch_size}.json" if multi_batch else STAGE_PROFILE_SUMMARY_FILE)
+        for artifact_path in (sample_profile_path, stage_profile_path, stage_profile_summary_path):
+            if artifact_path.exists():
+                artifact_path.unlink()
+
+        scratch_output_dir = output_dir / "_stage_profile_scratch" / f"batch{batch_size}"
+        stage = {
+            "id": f"profile.validation.shared.batch{batch_size}",
+            "label": f"profile validation shared batch {batch_size}",
+            "kind": "shared",
+            "samples": len(profile_samples),
+            "layer_count": max(union_layer_count, 1),
+            "weight": _stage_weight("shared", len(profile_samples), max(union_layer_count, 1)),
+        }
+        tracker = ProgressTracker(stage_plan=[stage], output_dir=scratch_output_dir, logger=logger, completed_stage_ids=set(), stage_durations={})
+        scratch_state = {
+            "task_name": "truthfulqa_tuned_bucket_cv_stage_profile",
+            "model_name": str(getattr(model, "name_or_path", "profile_model")),
+            "csv_path": "profile_first_n",
+            "split": {"mode": "profile_validation_shared_first_n", "num_samples": len(profile_samples)},
+            "prompt_style": prompt_style,
+            "score_mode": score_mode,
+            "mature_layer": mature_layer,
+            "dynamic_bucket_candidates": dynamic_buckets,
+            "static_layer_candidates": [{"internal": layer, "official": layer + 1} for layer in static_layers],
+            "transfer_reference": None,
+            "completed_stages": [],
+            "stage_durations_seconds": {},
+            "folds": {},
+            "created_at": _utc_now(),
+            "updated_at": _utc_now(),
+        }
+        scratch_fold_state = _ensure_fold_state(scratch_state, {"name": f"profile_batch{batch_size}", "validation_size": len(profile_samples), "test_size": 0})
+
+        logger.log(f"Profiling batch size {batch_size} -> stage={stage_profile_path}, inner={sample_profile_path}")
         status = "ok"
         error_message: str | None = None
         total_wall_start = time.perf_counter()
+        run_artifacts: dict[str, Any] | None = None
         try:
-            for sample_index, sample in enumerate(profile_samples):
-                bundle = _score_sample_multi_config(
-                    model=model,
-                    tokenizer=tokenizer,
-                    sample=sample,
-                    prompt_style=prompt_style,
-                    score_mode=score_mode,
-                    post_softmax=post_softmax,
-                    relative_top=relative_top,
-                    relative_top_value=relative_top_value,
-                    mature_layer=mature_layer,
-                    static_layers=static_layers,
-                    dynamic_buckets=dynamic_bucket_map,
-                    candidate_batch_size=batch_size,
-                )
-                profiling = bundle["profiling"]
-                record = {
-                    "sample_index": sample_index,
-                    "question": sample.question,
-                    "num_candidates": int(profiling["answer_count"]),
-                    "candidate_batch_size": int(profiling["batch_size"]),
-                    "prompt_len": int(profiling["prompt_len"]),
-                    "max_total_len": int(profiling["max_total_len"]),
-                    "union_layer_count": int(profiling["union_layer_count"] or union_layer_count),
-                    "build_prompt_and_candidates_sec": float(profiling["build_prompt_and_candidates_sec"]),
-                    "tokenize_sec": float(profiling["tokenize_sec"]),
-                    "model_forward_sec": float(profiling["model_forward_sec"]),
-                    "dynamic_rescore_sec": float(profiling["dynamic_rescore_sec"]),
-                    "static_rescore_sec": float(profiling["static_rescore_sec"]),
-                    "aggregate_write_sec": float(profiling["aggregate_write_sec"]),
-                    "materialize_sec": float(profiling["materialize_sec"]),
-                    "total_sample_sec": float(profiling["total_sample_sec"]),
-                    "forward_batches": int(profiling["batch_count"]),
-                }
-                records.append(record)
-                _append_jsonl(profile_path, record)
-                logger.log(
-                    f"profile batch={batch_size} sample={sample_index + 1}/{len(profile_samples)} total_sample_s={record['total_sample_sec']:.2f} "
-                    f"forward_s={record['model_forward_sec']:.2f} dynamic_s={record['dynamic_rescore_sec']:.2f} static_s={record['static_rescore_sec']:.2f}"
-                )
+            run_artifacts = _run_validation_shared_stage(
+                stage=stage,
+                tracker=tracker,
+                logger=logger,
+                state=scratch_state,
+                fold_state=scratch_fold_state,
+                output_dir=scratch_output_dir,
+                model=model,
+                tokenizer=tokenizer,
+                validation_sample_ids=list(range(len(profile_samples))),
+                validation_samples=profile_samples,
+                dynamic_buckets=dynamic_buckets,
+                static_layers=static_layers,
+                mature_layer=mature_layer,
+                prompt_style=prompt_style,
+                score_mode=score_mode,
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+                candidate_batch_size=batch_size,
+                stage_profile_limit=profile_first_n,
+                stage_profile_path=stage_profile_path,
+                stage_profile_summary_path=stage_profile_summary_path,
+                sample_profile_path=sample_profile_path,
+            )
         except RuntimeError as error:
             status = "runtime_error"
             error_message = str(error)
@@ -413,27 +691,45 @@ def _run_profile_mode(
             _safe_empty_cuda_cache()
             logger.log(f"Profiling batch size {batch_size} failed with {status}: {error_message}")
         total_wall_time = time.perf_counter() - total_wall_start
+
+        sample_profile_summary = None if run_artifacts is None else run_artifacts.get("sample_profile_summary")
+        stage_profile_summary = None if run_artifacts is None else run_artifacts.get("stage_profile_summary")
+        selected_dynamic = _select_best_dynamic(list(scratch_fold_state["validation_dynamic_candidates"].values())) if scratch_fold_state["validation_dynamic_candidates"] else None
+        selected_static = _select_best_static(list(scratch_fold_state["validation_static_candidates"].values())) if scratch_fold_state["validation_static_candidates"] else None
         result = {
             "candidate_batch_size": batch_size,
             "status": status,
             "error": error_message,
-            "num_samples_completed": len(records),
+            "num_samples_completed": 0 if run_artifacts is None else int(run_artifacts["num_samples_completed"]),
             "total_wall_time": total_wall_time,
-            "avg_total_sample_sec": _average([float(item["total_sample_sec"]) for item in records]),
-            "avg_build_prompt_and_candidates_sec": _average([float(item["build_prompt_and_candidates_sec"]) for item in records]),
-            "avg_tokenize_sec": _average([float(item["tokenize_sec"]) for item in records]),
-            "avg_model_forward_sec": _average([float(item["model_forward_sec"]) for item in records]),
-            "avg_dynamic_rescore_sec": _average([float(item["dynamic_rescore_sec"]) for item in records]),
-            "avg_static_rescore_sec": _average([float(item["static_rescore_sec"]) for item in records]),
-            "avg_aggregate_write_sec": _average([float(item["aggregate_write_sec"]) for item in records]),
-            "avg_forward_batches": _average([float(item["forward_batches"]) for item in records]),
-            "profile_path": str(profile_path),
+            "avg_total_sample_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_total_sample_sec"]),
+            "avg_build_prompt_and_candidates_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_build_prompt_and_candidates_sec"]),
+            "avg_tokenize_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_tokenize_sec"]),
+            "avg_model_forward_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_model_forward_sec"]),
+            "avg_dynamic_rescore_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_dynamic_rescore_sec"]),
+            "avg_static_rescore_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_static_rescore_sec"]),
+            "avg_aggregate_write_sec": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_aggregate_write_sec"]),
+            "avg_forward_batches": 0.0 if sample_profile_summary is None else float(sample_profile_summary["avg_forward_batches"]),
+            "avg_inner_score_sample_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_inner_score_sample_sec"]),
+            "avg_metrics_aggregation_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_metrics_aggregation_sec"]),
+            "avg_usage_merge_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_usage_merge_sec"]),
+            "avg_progress_callback_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_progress_callback_sec"]),
+            "avg_state_persist_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_state_persist_sec"]),
+            "avg_total_stage_sample_sec": 0.0 if stage_profile_summary is None else float(stage_profile_summary["avg_total_stage_sample_sec"]),
+            "sample_profile_path": str(sample_profile_path),
+            "stage_profile_path": str(stage_profile_path),
+            "stage_profile_summary_path": str(stage_profile_summary_path),
+            "selected_dynamic_bucket": None if selected_dynamic is None else str(selected_dynamic["name"]),
+            "selected_static_layer": None if selected_static is None else int(selected_static["premature_layer"]),
         }
         summary["batch_size_results"].append(result)
+        if stage_profile_summary is not None:
+            logger.log(f"profile batch={batch_size} avg_stage_sample_s={result['avg_total_stage_sample_sec']:.2f} inner_s={result['avg_inner_score_sample_sec']:.2f} callback_s={result['avg_progress_callback_sec']:.4f} persist_s={result['avg_state_persist_sec']:.4f}")
 
     summary_path = output_dir / "profile_summary.json"
     _atomic_write_json(summary_path, summary)
-    logger.log(f"Saved real hot-path profiling summary to: {summary_path}")
+    logger.log(f"Saved end-to-end stage profiling summary to: {summary_path}")
+
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -797,6 +1093,28 @@ def _stage_weight(kind: str, samples: int, layer_count: int) -> float:
     return float(samples * (layer_count if kind in {"dynamic", "shared"} else 1))
 
 
+def _estimate_expected_test_shared_layer_count(
+    dynamic_buckets: list[dict[str, object]],
+    static_layers: list[int],
+) -> int:
+    if not dynamic_buckets and not static_layers:
+        return 1
+    normalized_static_layers = [int(layer) for layer in static_layers]
+    if not dynamic_buckets:
+        return max(len(set(normalized_static_layers)), 1)
+    if not normalized_static_layers:
+        return max(
+            int(round(sum(len(set(int(layer) for layer in bucket["candidate_premature_layers"])) for bucket in dynamic_buckets) / len(dynamic_buckets))),
+            1,
+        )
+    union_counts: list[int] = []
+    for bucket in dynamic_buckets:
+        bucket_layers = {int(layer) for layer in bucket["candidate_premature_layers"]}
+        for static_layer in normalized_static_layers:
+            union_counts.append(len(bucket_layers | {int(static_layer)}))
+    return max(int(round(sum(union_counts) / len(union_counts))), 1)
+
+
 def _build_stage_plan(
     fold_specs: list[dict[str, object]],
     dynamic_buckets: list[dict[str, object]],
@@ -810,6 +1128,7 @@ def _build_stage_plan(
         }
     )
     validation_union_count = max(len(validation_union_layers), 1)
+    expected_test_shared_layer_count = _estimate_expected_test_shared_layer_count(dynamic_buckets, static_layers)
     for fold_spec in fold_specs:
         fold_name = str(fold_spec["name"])
         validation_size = int(fold_spec["validation_size"])
@@ -830,8 +1149,8 @@ def _build_stage_plan(
                 "label": f"{fold_name} held-out shared scoring",
                 "kind": "shared",
                 "samples": test_size,
-                "layer_count": 1,
-                "weight": _stage_weight("shared", test_size, 1),
+                "layer_count": expected_test_shared_layer_count,
+                "weight": _stage_weight("shared", test_size, expected_test_shared_layer_count),
             }
         )
     return plan
@@ -1404,11 +1723,15 @@ def _run_validation_shared_stage(
     relative_top: float,
     relative_top_value: float,
     candidate_batch_size: int,
-) -> None:
+    stage_profile_limit: int = 0,
+    stage_profile_path: Path | None = None,
+    stage_profile_summary_path: Path | None = None,
+    sample_profile_path: Path | None = None,
+) -> dict[str, Any]:
     if str(stage["id"]) in state["completed_stages"]:
         if fold_state["validation_dynamic_candidates"] and fold_state["validation_static_candidates"]:
             logger.log(f"Skipping completed stage: {stage['label']}")
-            return
+            return {"num_samples_completed": len(validation_samples), "sample_profile_summary": None, "stage_profile_summary": None}
         raise ValueError(f"Completed stage {stage['id']} is missing saved validation results.")
 
     tracker.start_stage(stage)
@@ -1420,17 +1743,16 @@ def _run_validation_shared_stage(
     vanilla_metric_rows: list[dict[str, float]] = []
     total_answers = 0
     total_forward_batches = 0
-    dynamic_bucket_map = {
-        str(item["name"]): list(item["candidate_premature_layers"])
-        for item in dynamic_buckets
-    }
+    dynamic_bucket_map = {str(item["name"]): list(item["candidate_premature_layers"]) for item in dynamic_buckets}
+    stage_profile_records: list[dict[str, Any]] = []
+    sample_profile_records: list[dict[str, Any]] = []
+    profile_limit = min(max(int(stage_profile_limit), 0), len(validation_samples))
+    union_layer_count = len({*static_layers, *(layer for layers in dynamic_bucket_map.values() for layer in layers)})
 
-    logger.log(
-        f"{fold_state['fold_name']} online reuse note: each validation sample is scored once across the union of "
-        f"{len(dynamic_buckets)} dynamic buckets and {len(static_layers)} static layers; no fold-wide logits cache is kept."
-    )
+    logger.log(f"{fold_state['fold_name']} online reuse note: each validation sample is scored once across the union of {len(dynamic_buckets)} dynamic buckets and {len(static_layers)} static layers; no fold-wide logits cache is kept.")
 
     for sample_position, sample in enumerate(validation_samples):
+        inner_score_start = time.perf_counter()
         bundle = _score_sample_multi_config(
             model=model,
             tokenizer=tokenizer,
@@ -1445,34 +1767,28 @@ def _run_validation_shared_stage(
             dynamic_buckets=dynamic_bucket_map,
             candidate_batch_size=candidate_batch_size,
         )
-        vanilla_metric_rows.append(bundle["vanilla_metrics"])
-        total_answers += int(bundle["profiling"]["answer_count"])
-        total_forward_batches += int(bundle["profiling"]["batch_count"])
-
-        for bucket in dynamic_buckets:
-            bucket_name = str(bucket["name"])
-            dynamic_metric_rows[bucket_name].append(bundle["dynamic_metrics"][bucket_name])
-            sample_usage = bundle["dynamic_layer_usage"].get(bucket_name) or {}
-            aggregate_usage = dynamic_layer_usage[bucket_name]
-            for layer, count in sample_usage.items():
-                aggregate_usage[int(layer)] = aggregate_usage.get(int(layer), 0) + int(count)
-
-        for layer in static_layers:
-            layer_key = str(layer)
-            static_metric_rows[layer_key].append(bundle["static_metrics"][layer_key])
-            sample_usage = bundle["static_layer_usage"].get(layer_key) or {}
-            aggregate_usage = static_layer_usage[layer_key]
-            for used_layer, count in sample_usage.items():
-                aggregate_usage[int(used_layer)] = aggregate_usage.get(int(used_layer), 0) + int(count)
-
-        callback(
-            {
-                "completed_samples": sample_position + 1,
-                "total_samples": len(validation_samples),
-                "sample_index": sample_position,
-                "question": sample.question,
-            }
+        inner_score_sample_sec = time.perf_counter() - inner_score_start
+        consume_stats = _consume_validation_shared_bundle(
+            bundle=bundle,
+            dynamic_buckets=dynamic_buckets,
+            static_layers=static_layers,
+            vanilla_metric_rows=vanilla_metric_rows,
+            dynamic_metric_rows=dynamic_metric_rows,
+            dynamic_layer_usage=dynamic_layer_usage,
+            static_metric_rows=static_metric_rows,
+            static_layer_usage=static_layer_usage,
         )
+        total_answers += int(consume_stats["answer_count"])
+        total_forward_batches += int(consume_stats["batch_count"])
+
+        progress_callback_start = time.perf_counter()
+        callback({"completed_samples": sample_position + 1, "total_samples": len(validation_samples), "sample_index": sample_position, "question": sample.question})
+        progress_callback_sec = time.perf_counter() - progress_callback_start
+
+        if sample_position < profile_limit:
+            stage_profile_records.append(_build_stage_sample_profile_record(sample_index=sample_position, sample=sample, bundle=bundle, inner_score_sample_sec=inner_score_sample_sec, metrics_aggregation_sec=float(consume_stats["metrics_aggregation_sec"]), usage_merge_sec=float(consume_stats["usage_merge_sec"]), progress_callback_sec=progress_callback_sec))
+            if sample_profile_path is not None:
+                sample_profile_records.append(_build_inner_sample_profile_record(sample_index=sample_position, sample=sample, profiling=bundle["profiling"], union_layer_count=union_layer_count))
 
     duration = tracker.finish_stage()
     avg_sample = duration / len(validation_samples)
@@ -1483,31 +1799,8 @@ def _run_validation_shared_stage(
         fold_state["validation_dynamic_candidates"][bucket_name] = {
             "name": bucket_name,
             "candidate_premature_layers": list(bucket["candidate_premature_layers"]),
-            "summary": _build_candidate_summary(
-                vanilla_metric_rows=vanilla_metric_rows,
-                dola_metric_rows=dynamic_metric_rows[bucket_name],
-                prompt_style=prompt_style,
-                score_mode=score_mode,
-                dola_score_mode="official_dynamic_dola",
-                post_softmax=post_softmax,
-                relative_top=relative_top,
-                relative_top_value=relative_top_value,
-                premature_layer=int(bucket["candidate_premature_layers"][0]),
-                candidate_premature_layers=list(bucket["candidate_premature_layers"]),
-                mature_layer=mature_layer,
-                layer_usage=dynamic_layer_usage[bucket_name],
-            ),
-            "profiling": {
-                "online_reuse_scope": "sample_union_layers",
-                "cache_hits": 0,
-                "cache_misses": len(validation_samples),
-                "cache_size": 0,
-                "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0,
-                "avg_seconds_per_sample": avg_sample,
-                "avg_seconds_per_answer": avg_answer,
-                "candidate_batch_size": candidate_batch_size,
-                "forward_batches": total_forward_batches,
-            },
+            "summary": _build_candidate_summary(vanilla_metric_rows=vanilla_metric_rows, dola_metric_rows=dynamic_metric_rows[bucket_name], prompt_style=prompt_style, score_mode=score_mode, dola_score_mode="official_dynamic_dola", post_softmax=post_softmax, relative_top=relative_top, relative_top_value=relative_top_value, premature_layer=int(bucket["candidate_premature_layers"][0]), candidate_premature_layers=list(bucket["candidate_premature_layers"]), mature_layer=mature_layer, layer_usage=dynamic_layer_usage[bucket_name]),
+            "profiling": {"online_reuse_scope": "sample_union_layers", "cache_hits": 0, "cache_misses": len(validation_samples), "cache_size": 0, "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0, "avg_seconds_per_sample": avg_sample, "avg_seconds_per_answer": avg_answer, "candidate_batch_size": candidate_batch_size, "forward_batches": total_forward_batches},
         }
 
     fold_state["validation_static_candidates"] = {}
@@ -1515,46 +1808,41 @@ def _run_validation_shared_stage(
         layer_key = str(layer)
         fold_state["validation_static_candidates"][layer_key] = {
             "premature_layer": layer,
-            "summary": _build_candidate_summary(
-                vanilla_metric_rows=vanilla_metric_rows,
-                dola_metric_rows=static_metric_rows[layer_key],
-                prompt_style=prompt_style,
-                score_mode=score_mode,
-                dola_score_mode="official_static_dola",
-                post_softmax=post_softmax,
-                relative_top=relative_top,
-                relative_top_value=relative_top_value,
-                premature_layer=layer,
-                candidate_premature_layers=None,
-                mature_layer=mature_layer,
-                layer_usage=static_layer_usage[layer_key],
-            ),
-            "profiling": {
-                "online_reuse_scope": "sample_union_layers",
-                "cache_hits": 0,
-                "cache_misses": len(validation_samples),
-                "cache_size": 0,
-                "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0,
-                "avg_seconds_per_sample": avg_sample,
-                "avg_seconds_per_answer": avg_answer,
-                "candidate_batch_size": candidate_batch_size,
-                "forward_batches": total_forward_batches,
-            },
+            "summary": _build_candidate_summary(vanilla_metric_rows=vanilla_metric_rows, dola_metric_rows=static_metric_rows[layer_key], prompt_style=prompt_style, score_mode=score_mode, dola_score_mode="official_static_dola", post_softmax=post_softmax, relative_top=relative_top, relative_top_value=relative_top_value, premature_layer=layer, candidate_premature_layers=None, mature_layer=mature_layer, layer_usage=static_layer_usage[layer_key]),
+            "profiling": {"online_reuse_scope": "sample_union_layers", "cache_hits": 0, "cache_misses": len(validation_samples), "cache_size": 0, "avg_answers_per_miss": (total_answers / len(validation_samples)) if validation_samples else 0.0, "avg_seconds_per_sample": avg_sample, "avg_seconds_per_answer": avg_answer, "candidate_batch_size": candidate_batch_size, "forward_batches": total_forward_batches},
         }
 
     _mark_stage_complete(state, stage_id=str(stage["id"]), duration_seconds=duration)
     fold_state["updated_at"] = _utc_now()
+    persist_start = time.perf_counter()
     _persist_state(output_dir, state, fold_name=str(fold_state["fold_name"]))
+    state_persist_sec = time.perf_counter() - persist_start
+    if stage_profile_records:
+        stage_profile_records[-1]["state_persist_sec"] = float(state_persist_sec)
+        stage_profile_records[-1]["total_stage_sample_sec"] = float(stage_profile_records[-1]["total_stage_sample_sec"] + state_persist_sec)
+
+    sample_profile_summary = None
+    if sample_profile_path is not None and sample_profile_records:
+        _write_jsonl_records(sample_profile_path, sample_profile_records)
+        sample_profile_summary = _summarize_inner_profile_records(sample_profile_records, batch_size=candidate_batch_size, sample_profile_path=sample_profile_path)
+
+    stage_profile_summary = None
+    if stage_profile_path is not None and stage_profile_records:
+        _write_jsonl_records(stage_profile_path, stage_profile_records)
+        stage_profile_summary = _summarize_stage_profile_records(stage_profile_records, batch_size=candidate_batch_size, stage_profile_path=stage_profile_path)
+        if stage_profile_summary_path is not None:
+            _atomic_write_json(stage_profile_summary_path, stage_profile_summary)
+
     best_dynamic = _current_best_mc3(fold_state["validation_dynamic_candidates"])
     best_static = _current_best_mc3(fold_state["validation_static_candidates"])
-    logger.log(
-        f"{fold_state['fold_name']} validation shared profiling: forward_batches={total_forward_batches}, "
-        f"candidate_batch_size={candidate_batch_size}, avg_sample_s={avg_sample:.2f}, avg_answer_s={avg_answer:.4f}"
-    )
+    logger.log(f"{fold_state['fold_name']} validation shared profiling: forward_batches={total_forward_batches}, candidate_batch_size={candidate_batch_size}, avg_sample_s={avg_sample:.2f}, avg_answer_s={avg_answer:.4f}")
+    if stage_profile_summary is not None:
+        logger.log(f"{fold_state['fold_name']} stage-profile avg_inner_s={stage_profile_summary['avg_inner_score_sample_sec']:.2f}, metrics_s={stage_profile_summary['avg_metrics_aggregation_sec']:.4f}, usage_s={stage_profile_summary['avg_usage_merge_sec']:.4f}, callback_s={stage_profile_summary['avg_progress_callback_sec']:.4f}, persist_s={stage_profile_summary['avg_state_persist_sec']:.4f}")
     if best_dynamic is not None:
         logger.log(f"{fold_state['fold_name']} current best validation dynamic MC3={best_dynamic:.4f}")
     if best_static is not None:
         logger.log(f"{fold_state['fold_name']} current best validation static MC3={best_static:.4f}")
+    return {"num_samples_completed": len(validation_samples), "sample_profile_summary": sample_profile_summary, "stage_profile_summary": stage_profile_summary}
 
 
 

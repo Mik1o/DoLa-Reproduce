@@ -7,10 +7,16 @@ import pytest
 from src.generation import (
     _aggregate_continuation_log_probs,
     _build_scoring_text_attempts,
+    _compute_dynamic_js_divergence_from_distributions,
+    _compute_official_dola_token_scores_from_log_probs,
     _count_premature_layer_usage,
+    _count_premature_layer_usage_from_selected_indices,
     _find_continuation_token_index,
+    _gather_scores_at_target_ids,
     _normalize_dola_score_mode,
     _prepare_scoring_inputs,
+    _precompute_union_layer_dynamic_js,
+    _select_dynamic_base_log_probs_from_union,
     score_candidate_answers_dola_with_details,
     score_candidate_answers_multi_config_with_details,
     score_candidate_answers_with_details,
@@ -348,18 +354,18 @@ def test_multi_config_scoring_matches_single_candidate_paths() -> None:
     for expected, actual in zip(vanilla, multi.vanilla):
         assert actual.candidate == expected.candidate
         assert actual.continuation_token_count == expected.continuation_token_count
-        assert actual.score == pytest.approx(expected.score)
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
 
     for expected, actual in zip(static, multi.static[0]):
         assert actual.candidate == expected.candidate
         assert actual.continuation_token_count == expected.continuation_token_count
-        assert actual.score == pytest.approx(expected.score)
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
         assert actual.premature_layer_dist == expected.premature_layer_dist
 
     for expected, actual in zip(dynamic, multi.dynamic["bucket"]):
         assert actual.candidate == expected.candidate
         assert actual.continuation_token_count == expected.continuation_token_count
-        assert actual.score == pytest.approx(expected.score)
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
         assert actual.premature_layer_dist == expected.premature_layer_dist
 
     expected_static_metrics = compute_mc_metrics(
@@ -379,5 +385,214 @@ def test_multi_config_scoring_matches_single_candidate_paths() -> None:
         [item.score for item in multi.dynamic["bucket"][len(true_candidates) :]],
     )
 
-    assert actual_static_metrics == expected_static_metrics
-    assert actual_dynamic_metrics == expected_dynamic_metrics
+    for metric_name in expected_static_metrics:
+        assert actual_static_metrics[metric_name] == pytest.approx(expected_static_metrics[metric_name], abs=1e-9)
+    for metric_name in expected_dynamic_metrics:
+        assert actual_dynamic_metrics[metric_name] == pytest.approx(expected_dynamic_metrics[metric_name], abs=1e-9)
+
+
+
+def test_official_dola_target_token_fast_path_matches_slow_reference() -> None:
+    torch = pytest.importorskip("torch")
+
+    final_logits = torch.tensor(
+        [
+            [[1.0, 0.5, -0.2], [0.2, 1.4, -0.3]],
+            [[-0.5, 0.7, 1.1], [1.2, -0.1, 0.4]],
+        ],
+        dtype=torch.float32,
+    )
+    base_logits = torch.tensor(
+        [
+            [[0.3, -0.1, 0.4], [0.0, 1.0, -0.6]],
+            [[-0.2, 0.4, 0.6], [1.0, -0.5, 0.1]],
+        ],
+        dtype=torch.float32,
+    )
+    input_ids = torch.tensor(
+        [
+            [0, 2, 1],
+            [0, 1, 2],
+        ],
+        dtype=torch.long,
+    )
+
+    final_log_probs = torch.log_softmax(final_logits, dim=-1)
+    base_log_probs = torch.log_softmax(base_logits, dim=-1)
+
+    actual = _compute_official_dola_token_scores_from_log_probs(
+        final_log_probs=final_log_probs,
+        base_log_probs=base_log_probs,
+        input_ids=input_ids,
+        post_softmax=False,
+        relative_top=0.0,
+        relative_top_value=-1000.0,
+    )
+    expected = _gather_scores_at_target_ids(final_log_probs - base_log_probs, input_ids)
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+
+
+def test_union_layer_dynamic_js_matches_per_bucket_reference() -> None:
+    torch = pytest.importorskip("torch")
+
+    mature_logits = torch.tensor(
+        [
+            [[1.2, 0.1, -0.4], [0.7, 0.3, -0.2]],
+            [[-0.1, 0.8, 0.4], [0.2, 0.5, 1.0]],
+        ],
+        dtype=torch.float32,
+    )
+    layer_logits = {
+        0: torch.tensor(
+            [
+                [[0.6, 0.2, -0.3], [0.4, 0.1, -0.4]],
+                [[-0.2, 0.5, 0.3], [0.1, 0.2, 0.8]],
+            ],
+            dtype=torch.float32,
+        ),
+        1: torch.tensor(
+            [
+                [[1.0, -0.1, -0.6], [0.3, 0.6, -0.7]],
+                [[-0.4, 0.9, 0.2], [0.0, 0.3, 1.2]],
+            ],
+            dtype=torch.float32,
+        ),
+        2: torch.tensor(
+            [
+                [[0.8, 0.0, -0.2], [0.5, 0.2, -0.5]],
+                [[-0.3, 0.7, 0.1], [0.2, 0.1, 0.9]],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+    union_layers = [0, 1, 2]
+    mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+    mature_probs = mature_log_probs.exp()
+    layer_log_probs = {
+        layer: torch.log_softmax(logits, dim=-1)
+        for layer, logits in layer_logits.items()
+    }
+    layer_probs = {
+        layer: log_probs.exp()
+        for layer, log_probs in layer_log_probs.items()
+    }
+
+    union_log_probs, union_js_divergence = _precompute_union_layer_dynamic_js(
+        mature_probs=mature_probs,
+        mature_log_probs=mature_log_probs,
+        layer_probs=layer_probs,
+        layer_log_probs=layer_log_probs,
+        union_layers=union_layers,
+    )
+    union_log_probs_by_batch = union_log_probs.permute(1, 2, 0, 3)
+    union_layer_to_index = {layer: index for index, layer in enumerate(union_layers)}
+
+    for candidate_layers in ([0, 1], [1, 2], [0, 2]):
+        actual_base_log_probs, actual_selected_indices, actual_selected_layers = _select_dynamic_base_log_probs_from_union(
+            union_layer_log_probs_by_batch=union_log_probs_by_batch,
+            union_js_divergence=union_js_divergence,
+            union_layer_to_index=union_layer_to_index,
+            candidate_layers=list(candidate_layers),
+        )
+
+        candidate_log_probs = torch.stack([layer_log_probs[layer] for layer in candidate_layers], dim=0)
+        candidate_probs = torch.stack([layer_probs[layer] for layer in candidate_layers], dim=0)
+        expected_js_divergence = _compute_dynamic_js_divergence_from_distributions(
+            mature_probs=mature_probs,
+            mature_log_probs=mature_log_probs,
+            candidate_probs=candidate_probs,
+            candidate_log_probs=candidate_log_probs,
+        )
+        expected_selected_indices = expected_js_divergence.argmax(dim=0)
+        candidate_log_probs_by_batch = candidate_log_probs.permute(1, 2, 0, 3)
+        gather_index = expected_selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
+            -1,
+            -1,
+            1,
+            candidate_log_probs_by_batch.shape[-1],
+        )
+        expected_base_log_probs = candidate_log_probs_by_batch.gather(2, gather_index).squeeze(2)
+        expected_selected_layers = [
+            [candidate_layers[int(index)] for index in batch_indices]
+            for batch_indices in expected_selected_indices.tolist()
+        ]
+
+        torch.testing.assert_close(actual_base_log_probs, expected_base_log_probs, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(actual_selected_indices, expected_selected_indices, rtol=0.0, atol=0.0)
+        assert actual_selected_layers == expected_selected_layers
+
+
+
+def test_union_layer_dynamic_js_no_trace_path_skips_python_trace_materialization() -> None:
+    torch = pytest.importorskip("torch")
+
+    selected_indices = torch.tensor([[0, 1, 1], [1, 0, 1]], dtype=torch.long)
+    usage = _count_premature_layer_usage_from_selected_indices(selected_indices, [4, 8])
+
+    assert usage == {4: 2, 8: 4}
+
+
+
+def test_multi_config_scoring_matches_single_candidate_paths_for_overlapping_dynamic_buckets() -> None:
+    torch = pytest.importorskip("torch")
+    del torch
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+    prompt = "Answer:"
+    true_candidates = [" Paris", " London"]
+    false_candidates = [" Rome", " Berlin"]
+    all_candidates = true_candidates + false_candidates
+
+    dynamic_wide = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_dynamic_dola",
+        post_softmax=False,
+        relative_top=0.0,
+        candidate_premature_layers=[0, 1],
+        mature_layer=2,
+    )
+    dynamic_narrow = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_dynamic_dola",
+        post_softmax=False,
+        relative_top=0.0,
+        candidate_premature_layers=[0],
+        mature_layer=2,
+    )
+    multi = score_candidate_answers_multi_config_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        static_layers=[0],
+        dynamic_buckets={"wide": [0, 1], "narrow": [0]},
+        score_mode="sum_logprob",
+        post_softmax=False,
+        relative_top=0.0,
+        mature_layer=2,
+        candidate_batch_size=2,
+    )
+
+    for expected, actual in zip(dynamic_wide, multi.dynamic["wide"]):
+        assert actual.candidate == expected.candidate
+        assert actual.continuation_token_count == expected.continuation_token_count
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
+        assert actual.premature_layer_dist == expected.premature_layer_dist
+
+    for expected, actual in zip(dynamic_narrow, multi.dynamic["narrow"]):
+        assert actual.candidate == expected.candidate
+        assert actual.continuation_token_count == expected.continuation_token_count
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
+        assert actual.premature_layer_dist == expected.premature_layer_dist

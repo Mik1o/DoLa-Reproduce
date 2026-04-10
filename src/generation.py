@@ -163,7 +163,7 @@ def score_continuation_details(
         separator=separator,
     )
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits[:, :-1, :]
         token_log_probs = _gather_token_log_probs(logits, input_ids)
@@ -365,12 +365,14 @@ def score_candidate_answers_multi_config_with_details(
     max_prompt_len = 0
     max_total_len = 0
 
-    all_needed_layers = sorted(
+    dynamic_union_layers = sorted(
         {
-            *resolved_static_layers,
-            *(layer for layers in resolved_dynamic_buckets.values() for layer in layers),
+            layer
+            for layers in resolved_dynamic_buckets.values()
+            for layer in layers
         }
     )
+    all_needed_layers = sorted({*resolved_static_layers, *dynamic_union_layers})
 
     for batch_start in range(0, len(candidate_answers), candidate_batch_size):
         batch_candidates = candidate_answers[batch_start : batch_start + candidate_batch_size]
@@ -395,7 +397,7 @@ def score_candidate_answers_multi_config_with_details(
         if valid_lengths:
             max_total_len = max(max_total_len, max(int(length) for length in valid_lengths))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             forward_start = time.perf_counter()
             outputs = model(
                 input_ids=batch_input_ids,
@@ -439,44 +441,38 @@ def score_candidate_answers_multi_config_with_details(
             }
             static_rescore_sec += time.perf_counter() - static_start
             dynamic_scores: dict[str, Any] = {}
-            dynamic_selected_layers: dict[str, list[list[int]]] = {}
+            dynamic_selected_indices: dict[str, Any] = {}
             dynamic_start = time.perf_counter()
-            for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
-                candidate_log_probs = torch.stack(
-                    [layer_log_probs[layer] for layer in candidate_layers],
-                    dim=0,
-                )
-                candidate_probs = torch.stack(
-                    [layer_probs[layer] for layer in candidate_layers],
-                    dim=0,
-                )
-                js_divergence = _compute_dynamic_js_divergence_from_distributions(
+            if resolved_dynamic_buckets:
+                dynamic_union_log_probs, dynamic_union_js_divergence = _precompute_union_layer_dynamic_js(
                     mature_probs=mature_probs,
                     mature_log_probs=mature_log_probs,
-                    candidate_probs=candidate_probs,
-                    candidate_log_probs=candidate_log_probs,
+                    layer_probs=layer_probs,
+                    layer_log_probs=layer_log_probs,
+                    union_layers=dynamic_union_layers,
                 )
-                selected_indices = js_divergence.argmax(dim=0)
-                candidate_log_probs_by_batch = candidate_log_probs.permute(1, 2, 0, 3)
-                gather_index = selected_indices.unsqueeze(-1).unsqueeze(-1).expand(
-                    -1,
-                    -1,
-                    1,
-                    candidate_log_probs_by_batch.shape[-1],
-                )
-                base_log_probs = candidate_log_probs_by_batch.gather(2, gather_index).squeeze(2)
-                dynamic_scores[bucket_name] = _compute_official_dola_token_scores_from_log_probs(
-                    final_log_probs=mature_log_probs,
-                    base_log_probs=base_log_probs,
-                    input_ids=batch_input_ids,
-                    post_softmax=post_softmax,
-                    relative_top=relative_top,
-                    relative_top_value=relative_top_value,
-                )
-                dynamic_selected_layers[bucket_name] = [
-                    [candidate_layers[int(index)] for index in batch_indices]
-                    for batch_indices in selected_indices.tolist()
-                ]
+                dynamic_union_log_probs_by_batch = dynamic_union_log_probs.permute(1, 2, 0, 3)
+                dynamic_union_layer_to_index = {
+                    layer: index
+                    for index, layer in enumerate(dynamic_union_layers)
+                }
+                for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
+                    base_log_probs, selected_bucket_indices, _ = _select_dynamic_base_log_probs_from_union(
+                        union_layer_log_probs_by_batch=dynamic_union_log_probs_by_batch,
+                        union_js_divergence=dynamic_union_js_divergence,
+                        union_layer_to_index=dynamic_union_layer_to_index,
+                        candidate_layers=candidate_layers,
+                        return_selected_layers_trace=False,
+                    )
+                    dynamic_scores[bucket_name] = _compute_official_dola_token_scores_from_log_probs(
+                        final_log_probs=mature_log_probs,
+                        base_log_probs=base_log_probs,
+                        input_ids=batch_input_ids,
+                        post_softmax=post_softmax,
+                        relative_top=relative_top,
+                        relative_top_value=relative_top_value,
+                    )
+                    dynamic_selected_indices[bucket_name] = selected_bucket_indices
             dynamic_rescore_sec += time.perf_counter() - dynamic_start
 
         materialize_start = time.perf_counter()
@@ -529,16 +525,17 @@ def score_candidate_answers_multi_config_with_details(
                     continuation_log_probs=dynamic_slice,
                     score_mode=score_mode,
                 )
-                continuation_layers = dynamic_selected_layers[bucket_name][batch_index][
-                    _get_continuation_start_index(prompt_len) : valid_target_length
+                selected_bucket_indices = dynamic_selected_indices[bucket_name][
+                    batch_index,
+                    _get_continuation_start_index(prompt_len) : valid_target_length,
                 ]
                 results.dynamic[bucket_name].append(
                     CandidateScore(
                         candidate=candidate_answer,
                         score=score,
                         continuation_token_count=token_count,
-                        premature_layer_dist=_count_premature_layer_usage(
-                            continuation_layers,
+                        premature_layer_dist=_count_premature_layer_usage_from_selected_indices(
+                            selected_bucket_indices,
                             candidate_layers,
                         )
                         or None,
@@ -624,7 +621,7 @@ def score_continuation_dola_details(
     if lm_head is None:
         raise ValueError("The model does not expose output embeddings for DoLa-style scoring.")
 
-    with torch.no_grad():
+    with torch.inference_mode():
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -889,6 +886,12 @@ def _compute_official_dola_token_scores_from_log_probs(
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
 
+    if not post_softmax and relative_top == 0.0:
+        # Fast path for tuned TruthfulQA-MC CV: only target-token scores are needed.
+        final_target_log_probs = _gather_scores_at_target_ids(final_log_probs, input_ids)
+        base_target_log_probs = _gather_scores_at_target_ids(base_log_probs, input_ids)
+        return final_target_log_probs - base_target_log_probs
+
     diff_logits = final_log_probs - base_log_probs
     if post_softmax:
         diff_logits = torch.log_softmax(diff_logits, dim=-1)
@@ -963,6 +966,81 @@ def _compute_dynamic_js_divergence_from_distributions(
 
 
 
+def _precompute_union_layer_dynamic_js(
+    mature_probs: Any,
+    mature_log_probs: Any,
+    layer_probs: dict[int, Any],
+    layer_log_probs: dict[int, Any],
+    union_layers: list[int],
+) -> tuple[Any, Any]:
+    """Compute union-layer log-probs and JS divergence once for overlapping buckets."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    union_layer_log_probs = torch.stack(
+        [layer_log_probs[layer] for layer in union_layers],
+        dim=0,
+    )
+    union_layer_probs = torch.stack(
+        [layer_probs[layer] for layer in union_layers],
+        dim=0,
+    )
+    union_js_divergence = _compute_dynamic_js_divergence_from_distributions(
+        mature_probs=mature_probs,
+        mature_log_probs=mature_log_probs,
+        candidate_probs=union_layer_probs,
+        candidate_log_probs=union_layer_log_probs,
+    )
+    return union_layer_log_probs, union_js_divergence
+
+
+
+def _select_dynamic_base_log_probs_from_union(
+    union_layer_log_probs_by_batch: Any,
+    union_js_divergence: Any,
+    union_layer_to_index: dict[int, int],
+    candidate_layers: list[int],
+    *,
+    return_selected_layers_trace: bool = True,
+) -> tuple[Any, Any, list[list[int]] | None]:
+    """Select bucket-local dynamic base log-probs by slicing precomputed union JS."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    bucket_union_indices = torch.tensor(
+        [union_layer_to_index[layer] for layer in candidate_layers],
+        device=union_js_divergence.device,
+        dtype=torch.long,
+    )
+    bucket_js_divergence = union_js_divergence.index_select(0, bucket_union_indices)
+    selected_bucket_indices = bucket_js_divergence.argmax(dim=0)
+    selected_union_indices = bucket_union_indices[selected_bucket_indices]
+    gather_index = selected_union_indices.unsqueeze(-1).unsqueeze(-1).expand(
+        -1,
+        -1,
+        1,
+        union_layer_log_probs_by_batch.shape[-1],
+    )
+    base_log_probs = union_layer_log_probs_by_batch.gather(2, gather_index).squeeze(2)
+    selected_layers_trace = _build_selected_layers_trace(
+        selected_indices=selected_bucket_indices,
+        candidate_layers=candidate_layers,
+        return_selected_layers_trace=return_selected_layers_trace,
+    )
+    return base_log_probs, selected_bucket_indices, selected_layers_trace
+
+
+
 def _compute_dynamic_js_divergence(
     mature_logits: Any,
     candidate_logits: Any,
@@ -993,7 +1071,9 @@ def _select_dynamic_base_logits_batched(
     mature_logits: Any,
     candidate_logits: Any,
     candidate_layers: list[int],
-) -> tuple[Any, list[list[int]]]:
+    *,
+    return_selected_layers_trace: bool = True,
+) -> tuple[Any, Any, list[list[int]] | None]:
     """Pick one premature layer per token position via JS divergence for each batch item."""
     try:
         import torch
@@ -1016,11 +1096,12 @@ def _select_dynamic_base_logits_batched(
         candidate_logits_by_batch.shape[-1],
     )
     base_logits = candidate_logits_by_batch.gather(2, gather_index).squeeze(2)
-    selected_layers = [
-        [candidate_layers[int(index)] for index in batch_indices]
-        for batch_indices in selected_indices.tolist()
-    ]
-    return base_logits, selected_layers
+    selected_layers_trace = _build_selected_layers_trace(
+        selected_indices=selected_indices,
+        candidate_layers=candidate_layers,
+        return_selected_layers_trace=return_selected_layers_trace,
+    )
+    return base_logits, selected_indices, selected_layers_trace
 
 
 
@@ -1030,14 +1111,58 @@ def _select_dynamic_base_logits(
     candidate_layers: list[int],
 ) -> tuple[Any, list[int]]:
     """Pick one premature layer per token position via JS divergence."""
-    base_logits, selected_layers = _select_dynamic_base_logits_batched(
+    base_logits, _, selected_layers = _select_dynamic_base_logits_batched(
         mature_logits=mature_logits,
         candidate_logits=candidate_logits,
         candidate_layers=candidate_layers,
+        return_selected_layers_trace=True,
     )
-    if len(selected_layers) != 1:
+    if selected_layers is None or len(selected_layers) != 1:
         raise ValueError("official_dynamic_dola single-candidate path expects batch size 1 scoring.")
     return base_logits, selected_layers[0]
+
+
+
+def _build_selected_layers_trace(
+    *,
+    selected_indices: Any,
+    candidate_layers: list[int],
+    return_selected_layers_trace: bool,
+) -> list[list[int]] | None:
+    """Materialize per-token selected-layer traces only when a caller explicitly needs them."""
+    if not return_selected_layers_trace:
+        return None
+    return [
+        [candidate_layers[int(index)] for index in batch_indices]
+        for batch_indices in selected_indices.tolist()
+    ]
+
+
+
+def _count_premature_layer_usage_from_selected_indices(
+    selected_layer_indices: Any,
+    candidate_layers: list[int],
+) -> dict[int, int]:
+    """Count selected premature layers directly from tensor indices without token-level Python traces."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for DoLa-style candidate scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    if selected_layer_indices.numel() == 0:
+        return {}
+    counts = torch.bincount(
+        selected_layer_indices.reshape(-1),
+        minlength=len(candidate_layers),
+    )
+    return {
+        int(candidate_layers[index]): int(count)
+        for index, count in enumerate(counts.tolist())
+        if int(count) > 0
+    }
 
 
 
