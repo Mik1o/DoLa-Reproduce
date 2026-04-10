@@ -18,6 +18,8 @@ SCRIPT_MODULES = [
     "scripts.check_env",
     "scripts.hf_audit_dynamic_collapse",
     "scripts.hf_audit_precision_sensitivity",
+    "scripts.hf_revalidate_paper_bucket_truthfulqa_cv",
+    "scripts.hf_run_paper_transferred_truthfulqa_baseline",
     "scripts.hf_tune_bucket_truthfulqa_cv",
     "scripts.hf_audit_truthfulqa_mc_kernel",
     "scripts.hf_diagnose_official_parity",

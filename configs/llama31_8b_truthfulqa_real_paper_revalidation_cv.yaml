@@ -1,0 +1,29 @@
+task_name: "llama31_8b_truthfulqa_real_paper_revalidation_cv"
+model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+model_label: "meta-llama/Llama-3.1-8B (base-assumed local copy)"
+device: "cuda"
+torch_dtype: "bfloat16"
+use_fast_tokenizer: false
+trust_remote_code: false
+attn_implementation: "sdpa"
+local_files_only: true
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+split_seed: 20260407
+validation_metric: "MC3"
+mature_layer: 31
+dynamic_bucket_candidates:
+  - name: "paper_high_16_32"
+    candidate_premature_layers: [15, 17, 19, 21, 23, 25, 27, 29]
+  - name: "paper_low_0_16"
+    candidate_premature_layers: [1, 3, 5, 7, 9, 11, 13]
+low_bucket_name: "paper_low_0_16"
+low_bucket_kind: "approx_low_bucket_test"
+low_bucket_note: "Current implementation selects transformer block outputs only; embedding output is not selectable, so the low bucket is approximate rather than paper-faithful."
+static_layer_candidates: [15, 17, 19, 21, 23, 25, 27, 29]
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+candidate_batch_size: 1
+output_dir: "outputs/llama31_8b_truthfulqa_real_paper_revalidation_cv"
