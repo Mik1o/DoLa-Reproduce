@@ -1,0 +1,29 @@
+task_name: "llama31_8b_factor_paper_low_baseline"
+baseline_name: "approx_paper_low_bucket_factor"
+model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+device: "cuda"
+csv_path: "data/factor/wiki_factor.csv"
+output_dir: "outputs/llama31_8b_factor_paper_low_baseline"
+
+use_safetensors: true
+local_files_only: true
+torch_dtype: "bfloat16"
+attn_implementation: "sdpa"
+use_fast_tokenizer: true
+
+score_mode: "sum_logprob"
+mature_layer: 31
+post_softmax: true
+relative_top: 0.1
+relative_top_value: -1000.0
+candidate_batch_size: 1
+
+low_bucket_note: "Current implementation selects transformer block outputs only; official layer 0 (embedding output) is not selectable, so this FACTOR low bucket is approximate rather than fully paper-faithful."
+
+dynamic_bucket:
+  name: "approx_paper_low_bucket_factor"
+  official_candidate_premature_layers: [0, 2, 4, 6, 8, 10, 12, 14]
+  official_mature_layer: 32
+  candidate_premature_layers: [1, 3, 5, 7, 9, 11, 13]
+
+static_layer_candidates: [1, 3, 5, 7, 9, 11, 13]

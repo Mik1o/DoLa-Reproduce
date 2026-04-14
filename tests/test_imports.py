@@ -7,6 +7,7 @@ import importlib
 
 CORE_MODULES = [
     "src.dola_utils",
+    "src.factor",
     "src.generation",
     "src.metrics",
     "src.modeling",
@@ -18,6 +19,7 @@ SCRIPT_MODULES = [
     "scripts.check_env",
     "scripts.hf_audit_dynamic_collapse",
     "scripts.hf_audit_precision_sensitivity",
+    "scripts.hf_run_factor_paper_low_baseline",
     "scripts.hf_revalidate_paper_bucket_truthfulqa_cv",
     "scripts.hf_run_paper_transferred_truthfulqa_baseline",
     "scripts.hf_tune_bucket_truthfulqa_cv",
