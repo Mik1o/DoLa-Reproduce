@@ -1,6 +1,6 @@
 task_name: "llama31_8b_factor_news_paper_low_baseline_faithful"
 baseline_name: "DoLa paper-transferred low bucket"
-model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+model_name: "/root/rivermind-data/models/Llama-3.1-8B"
 device: "cuda"
 csv_path: "data/factor/news_factor.csv"
 output_dir: "outputs/llama31_8b_factor_news_paper_low_baseline_faithful"
