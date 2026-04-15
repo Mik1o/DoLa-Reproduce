@@ -26,6 +26,50 @@ def _get_model_runtime_device(model: Any) -> Any:
         return "cpu"
 
 
+def _forward_hidden_states_only(
+    model: Any,
+    *,
+    input_ids: Any,
+    attention_mask: Any,
+) -> Any:
+    """Run a hidden-state-only forward to avoid allocating unused LM logits/cache."""
+    base_model = getattr(model, "model", None)
+    if base_model is not None:
+        try:
+            outputs = base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
+            )
+        except TypeError:
+            outputs = base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+    else:
+        try:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+                return_dict=True,
+            )
+        except TypeError:
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if hidden_states is None:
+        raise ValueError("The model did not return hidden_states for DoLa-style scoring.")
+    return hidden_states
+
+
 @dataclass(slots=True)
 class CandidateScore:
     candidate: str
@@ -165,7 +209,10 @@ def score_continuation_details(
     )
 
     with torch.inference_mode():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        try:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+        except TypeError:
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits[:, :-1, :]
         token_log_probs = _gather_token_log_probs(logits, input_ids)
 
@@ -402,15 +449,12 @@ def score_candidate_answers_multi_config_with_details(
 
         with torch.inference_mode():
             forward_start = time.perf_counter()
-            outputs = model(
+            hidden_states = _forward_hidden_states_only(
+                model,
                 input_ids=batch_input_ids,
                 attention_mask=batch_attention_mask,
-                output_hidden_states=True,
             )
             model_forward_sec += time.perf_counter() - forward_start
-            hidden_states = outputs.hidden_states
-            if hidden_states is None:
-                raise ValueError("The model did not return hidden_states for multi-config scoring.")
 
             mature_hidden = hidden_states[
                 internal_layer_to_hidden_state_index(resolved_mature_layer, num_hidden_layers)
@@ -635,14 +679,11 @@ def score_continuation_dola_details(
         raise ValueError("The model does not expose output embeddings for DoLa-style scoring.")
 
     with torch.inference_mode():
-        outputs = model(
+        hidden_states = _forward_hidden_states_only(
+            model,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
         )
-        hidden_states = outputs.hidden_states
-        if hidden_states is None:
-            raise ValueError("The model did not return hidden_states for DoLa-style scoring.")
 
         mature_hidden = hidden_states[
             internal_layer_to_hidden_state_index(resolved_mature_layer, num_hidden_layers)

@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -265,23 +266,38 @@ def main() -> None:
     last_log_time = start_time
 
     for sample_index, sample in enumerate(samples):
-        true_candidate, false_candidates = build_factor_candidates(sample)
-        all_candidates = [true_candidate, *false_candidates]
+        try:
+            true_candidate, false_candidates = build_factor_candidates(sample)
+            all_candidates = [true_candidate, *false_candidates]
 
-        score_result = score_candidate_answers_multi_config_with_details(
-            model=model,
-            tokenizer=tokenizer,
-            prompt=sample.prefix,
-            candidate_answers=all_candidates,
-            static_layers=static_layers,
-            dynamic_buckets=dynamic_bucket_map,
-            score_mode=score_mode,
-            post_softmax=post_softmax,
-            relative_top=relative_top,
-            relative_top_value=relative_top_value,
-            mature_layer=mature_layer,
-            candidate_batch_size=candidate_batch_size,
-        )
+            score_result = score_candidate_answers_multi_config_with_details(
+                model=model,
+                tokenizer=tokenizer,
+                prompt=sample.prefix,
+                candidate_answers=all_candidates,
+                static_layers=static_layers,
+                dynamic_buckets=dynamic_bucket_map,
+                score_mode=score_mode,
+                post_softmax=post_softmax,
+                relative_top=relative_top,
+                relative_top_value=relative_top_value,
+                mature_layer=mature_layer,
+                candidate_batch_size=candidate_batch_size,
+            )
+        except Exception as error:
+            _log(
+                output_dir,
+                "FAILED "
+                f"sample_index={sample_index} "
+                f"prefix_column={sample.prefix_column} "
+                f"prefix_chars={len(sample.prefix)} "
+                f"completion_chars={len(sample.completion)} "
+                f"contradiction_chars={[len(sample.contradiction_0), len(sample.contradiction_1), len(sample.contradiction_2)]} "
+                f"error={error}",
+            )
+            for line in traceback.format_exc().splitlines():
+                _log(output_dir, line)
+            raise
 
         vanilla_true = score_result.vanilla[0].score
         vanilla_false = [item.score for item in score_result.vanilla[1:]]
