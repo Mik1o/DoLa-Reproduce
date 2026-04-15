@@ -20,6 +20,7 @@ SCRIPT_MODULES = [
     "scripts.hf_audit_dynamic_collapse",
     "scripts.hf_audit_precision_sensitivity",
     "scripts.hf_run_factor_paper_low_baseline",
+    "scripts.hf_revalidate_factor_low_high",
     "scripts.hf_revalidate_paper_bucket_truthfulqa_cv",
     "scripts.hf_run_paper_transferred_truthfulqa_baseline",
     "scripts.hf_tune_bucket_truthfulqa_cv",

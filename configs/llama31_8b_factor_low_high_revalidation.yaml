@@ -1,0 +1,32 @@
+task_name: "llama31_8b_factor_low_high_revalidation"
+model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+device: "cuda"
+wiki_csv_path: "data/factor/wiki_factor.csv"
+news_csv_path: "data/factor/news_factor.csv"
+output_dir: "outputs/llama31_8b_factor_low_high_revalidation"
+
+use_safetensors: true
+local_files_only: true
+torch_dtype: "bfloat16"
+attn_implementation: "sdpa"
+use_fast_tokenizer: true
+
+score_mode: "sum_logprob"
+mature_layer: 31
+post_softmax: true
+relative_top: 0.1
+relative_top_value: -1000.0
+candidate_batch_size: 1
+
+paper_low_bucket:
+  name: "paper_low_0_16"
+  official_candidate_premature_layers: [0, 2, 4, 6, 8, 10, 12, 14]
+  official_mature_layer: 32
+
+paper_high_bucket:
+  name: "paper_high_16_32"
+  official_candidate_premature_layers: [16, 18, 20, 22, 24, 26, 28, 30]
+  official_mature_layer: 32
+
+static_low_candidates_official: [0, 2, 4, 6, 8, 10, 12, 14]
+static_high_candidates_official: [16, 18, 20, 22, 24, 26, 28, 30]
