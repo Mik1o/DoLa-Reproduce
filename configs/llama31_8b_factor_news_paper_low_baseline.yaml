@@ -1,0 +1,28 @@
+task_name: "llama31_8b_factor_news_paper_low_baseline_faithful"
+baseline_name: "DoLa paper-transferred low bucket"
+model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+device: "cuda"
+csv_path: "data/factor/news_factor.csv"
+output_dir: "outputs/llama31_8b_factor_news_paper_low_baseline_faithful"
+
+use_safetensors: true
+local_files_only: true
+torch_dtype: "bfloat16"
+attn_implementation: "sdpa"
+use_fast_tokenizer: true
+
+score_mode: "sum_logprob"
+mature_layer: 31
+post_softmax: true
+relative_top: 0.1
+relative_top_value: -1000.0
+candidate_batch_size: 1
+
+low_bucket_note: "Fully paper-faithful FACTOR low bucket. Official layer 0 maps to the embedding output (hidden_states[0]), and official layers 2..14 map to local block outputs 1..13."
+
+dynamic_bucket:
+  name: "paper_transferred_low_bucket_factor"
+  official_candidate_premature_layers: [0, 2, 4, 6, 8, 10, 12, 14]
+  official_mature_layer: 32
+
+static_layer_candidates_official: [0, 2, 4, 6, 8, 10, 12, 14]
