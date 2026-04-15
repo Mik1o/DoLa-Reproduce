@@ -5,9 +5,13 @@ from __future__ import annotations
 import pytest
 
 from src.dola_utils import (
+    EMBEDDING_OUTPUT_LAYER_INDEX,
     describe_dola_pair,
     get_mature_layer_index,
+    internal_layer_to_hidden_state_index,
+    internal_layer_to_official_layer_id,
     normalize_layer_bucket,
+    official_layer_id_to_internal,
     validate_candidate_premature_layers,
     validate_mature_layer,
     validate_premature_layer,
@@ -61,10 +65,28 @@ def test_validate_candidate_premature_layers_rejects_bad_inputs() -> None:
         validate_candidate_premature_layers([1, 6], mature_layer=6, num_hidden_layers=8)
 
 
+def test_validate_candidate_premature_layers_can_include_embedding_output_when_enabled() -> None:
+    assert validate_candidate_premature_layers(
+        [EMBEDDING_OUTPUT_LAYER_INDEX, 1, 3],
+        mature_layer=6,
+        num_hidden_layers=8,
+        allow_embedding_output=True,
+    ) == [EMBEDDING_OUTPUT_LAYER_INDEX, 1, 3]
+
+
 
 def test_get_mature_layer_index_returns_last_decoder_layer() -> None:
     """The mature layer should be the final decoder block index."""
     assert get_mature_layer_index(4) == 3
+
+
+def test_embedding_output_layer_mapping_matches_hidden_state_and_official_ids() -> None:
+    assert official_layer_id_to_internal(0, 32) == EMBEDDING_OUTPUT_LAYER_INDEX
+    assert internal_layer_to_hidden_state_index(EMBEDDING_OUTPUT_LAYER_INDEX, 32) == 0
+    assert internal_layer_to_official_layer_id(EMBEDDING_OUTPUT_LAYER_INDEX, 32) == 0
+    assert official_layer_id_to_internal(32, 32) == 31
+    assert internal_layer_to_hidden_state_index(31, 32) == 32
+    assert internal_layer_to_official_layer_id(31, 32) == 32
 
 
 

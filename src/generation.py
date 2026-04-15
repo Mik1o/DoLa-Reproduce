@@ -9,6 +9,7 @@ from typing import Any
 
 from src.dola_utils import (
     get_mature_layer_index,
+    internal_layer_to_hidden_state_index,
     validate_candidate_premature_layers,
     validate_mature_layer,
 )
@@ -329,12 +330,14 @@ def score_candidate_answers_multi_config_with_details(
         static_layers,
         resolved_mature_layer,
         num_hidden_layers,
+        allow_embedding_output=any(int(layer) < 0 for layer in static_layers),
     )
     resolved_dynamic_buckets = {
         str(name): validate_candidate_premature_layers(
             layers,
             resolved_mature_layer,
             num_hidden_layers,
+            allow_embedding_output=any(int(layer) < 0 for layer in layers),
         )
         for name, layers in dynamic_buckets.items()
     }
@@ -409,14 +412,20 @@ def score_candidate_answers_multi_config_with_details(
             if hidden_states is None:
                 raise ValueError("The model did not return hidden_states for multi-config scoring.")
 
-            mature_hidden = hidden_states[resolved_mature_layer + 1]
+            mature_hidden = hidden_states[
+                internal_layer_to_hidden_state_index(resolved_mature_layer, num_hidden_layers)
+            ]
             mature_logits = lm_head(mature_hidden[:, :-1, :])
             mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
             mature_probs = mature_log_probs.exp()
             vanilla_scores = _gather_scores_at_target_ids(mature_log_probs, batch_input_ids)
 
             layer_logits = {
-                layer: lm_head(hidden_states[layer + 1][:, :-1, :])
+                layer: lm_head(
+                    hidden_states[
+                        internal_layer_to_hidden_state_index(layer, num_hidden_layers)
+                    ][:, :-1, :]
+                )
                 for layer in all_needed_layers
             }
             layer_log_probs = {
@@ -581,6 +590,8 @@ def score_continuation_dola_details(
     -----
     For decoder-only models, ``hidden_states[0]`` is the embedding output and
     ``hidden_states[k + 1]`` corresponds to the output of decoder block ``k``.
+    This scorer keeps the existing local block ids (``0`` means decoder block 0)
+    and additionally allows ``-1`` as a special embedding-output candidate id.
     """
     try:
         import torch
@@ -609,12 +620,14 @@ def score_continuation_dola_details(
             [premature_layer],
             resolved_mature_layer,
             num_hidden_layers,
+            allow_embedding_output=int(premature_layer) < 0,
         )[0]
     else:
         resolved_candidate_layers = validate_candidate_premature_layers(
             candidate_premature_layers,
             resolved_mature_layer,
             num_hidden_layers,
+            allow_embedding_output=any(int(layer) < 0 for layer in candidate_premature_layers or []),
         )
 
     lm_head = model.get_output_embeddings()
@@ -631,16 +644,22 @@ def score_continuation_dola_details(
         if hidden_states is None:
             raise ValueError("The model did not return hidden_states for DoLa-style scoring.")
 
-        mature_hidden = hidden_states[resolved_mature_layer + 1]
+        mature_hidden = hidden_states[
+            internal_layer_to_hidden_state_index(resolved_mature_layer, num_hidden_layers)
+        ]
         mature_logits = lm_head(mature_hidden[:, :-1, :])
 
         if normalized_dola_mode == "legacy_contrastive":
-            premature_hidden = hidden_states[resolved_premature_layer + 1]
+            premature_hidden = hidden_states[
+                internal_layer_to_hidden_state_index(resolved_premature_layer, num_hidden_layers)
+            ]
             premature_logits = lm_head(premature_hidden[:, :-1, :])
             token_scores = _gather_token_log_probs(mature_logits - premature_logits, input_ids)
             selected_layers: list[int] = [resolved_premature_layer] * int(mature_logits.shape[1])
         elif normalized_dola_mode == "official_static_dola":
-            premature_hidden = hidden_states[resolved_premature_layer + 1]
+            premature_hidden = hidden_states[
+                internal_layer_to_hidden_state_index(resolved_premature_layer, num_hidden_layers)
+            ]
             premature_logits = lm_head(premature_hidden[:, :-1, :])
             token_scores = _compute_official_dola_token_scores(
                 mature_logits=mature_logits,
@@ -653,7 +672,14 @@ def score_continuation_dola_details(
             selected_layers = [resolved_premature_layer] * int(mature_logits.shape[1])
         else:
             candidate_logits = torch.stack(
-                [lm_head(hidden_states[layer + 1][:, :-1, :]) for layer in resolved_candidate_layers],
+                [
+                    lm_head(
+                        hidden_states[
+                            internal_layer_to_hidden_state_index(layer, num_hidden_layers)
+                        ][:, :-1, :]
+                    )
+                    for layer in resolved_candidate_layers
+                ],
                 dim=0,
             )
             base_logits, selected_layers = _select_dynamic_base_logits(

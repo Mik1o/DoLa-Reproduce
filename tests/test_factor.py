@@ -65,6 +65,16 @@ def test_classify_factor_baseline_marks_positive_approximate_transfer() -> None:
     assert label == "LIKELY_FACTOR_LOW_BUCKET_ONLY_APPROXIMATE"
 
 
+def test_classify_factor_baseline_marks_positive_paper_faithful_transfer() -> None:
+    label = _classify_factor_baseline(
+        embedding_inclusive=True,
+        vanilla_accuracy=0.40,
+        dynamic_accuracy=0.52,
+    )
+
+    assert label == "LIKELY_FACTOR_PAPER_LOW_BUCKET_HOLDS"
+
+
 def test_classify_factor_baseline_requires_embedding_when_approximate_transfer_fails() -> None:
     label = _classify_factor_baseline(
         embedding_inclusive=False,

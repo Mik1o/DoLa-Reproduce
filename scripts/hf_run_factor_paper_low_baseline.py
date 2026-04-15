@@ -15,7 +15,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.hf_eval_compare_subset import LOAD_CONFIG_KEYS
-from src.dola_utils import normalize_layer_bucket
+from src.dola_utils import (
+    internal_layer_to_official_layer_id,
+    normalize_layer_bucket,
+    official_layer_id_to_internal,
+)
 from src.factor import (
     aggregate_factor_accuracy,
     build_factor_candidates,
@@ -76,8 +80,8 @@ def _aggregate_layer_usage(items: list[object]) -> dict[int, int] | None:
 
 
 def _embedding_output_candidate_supported() -> bool:
-    """Current local scorer only addresses transformer block outputs."""
-    return False
+    """Return whether the local scorer can select ``hidden_states[0]`` as a candidate."""
+    return True
 
 
 def _classify_factor_baseline(
@@ -101,6 +105,11 @@ def _select_best_static_observed(static_results: dict[int, dict[str, float | int
         static_results.items(),
         key=lambda item: (float(item[1]["accuracy"]), int(item[1]["correct_count"])),
     )
+
+
+def _static_result_key(layer: int, num_hidden_layers: int) -> str:
+    """Build a stable summary key for one static low-layer sanity row."""
+    return f"static_official_{internal_layer_to_official_layer_id(layer, num_hidden_layers)}"
 
 
 def main() -> None:
@@ -127,12 +136,11 @@ def main() -> None:
 
     dynamic_bucket_config = config.get("dynamic_bucket")
     if not isinstance(dynamic_bucket_config, dict):
-        raise ValueError("dynamic_bucket must be a mapping with name and candidate_premature_layers.")
+        raise ValueError(
+            "dynamic_bucket must be a mapping with name and official_candidate_premature_layers "
+            "or candidate_premature_layers."
+        )
     dynamic_bucket_name = str(dynamic_bucket_config["name"])
-    raw_dynamic_layers = [int(layer) for layer in dynamic_bucket_config["candidate_premature_layers"]]
-    raw_static_layers = [int(layer) for layer in config.get("static_layer_candidates", [])]
-    if not raw_static_layers:
-        raise ValueError("static_layer_candidates must contain at least one layer.")
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
     samples = load_factor_samples(csv_path)
@@ -147,23 +155,94 @@ def main() -> None:
         **model_kwargs,
     )
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
-
-    dynamic_layers = normalize_layer_bucket(
-        raw_dynamic_layers,
-        mature_layer,
-        num_hidden_layers,
-        field_name=f"{dynamic_bucket_name}.candidate_premature_layers",
-    )
-    static_layers = normalize_layer_bucket(
-        raw_static_layers,
-        mature_layer,
-        num_hidden_layers,
-        field_name="static_layer_candidates",
-    )
-    dynamic_bucket_map = {dynamic_bucket_name: dynamic_layers}
-
     embedding_inclusive = _embedding_output_candidate_supported()
-    official_dynamic_layers = [int(layer) for layer in dynamic_bucket_config.get("official_candidate_premature_layers", [])]
+    official_dynamic_layers = [
+        int(layer)
+        for layer in dynamic_bucket_config.get("official_candidate_premature_layers", [])
+    ]
+    if official_dynamic_layers:
+        dynamic_layers = normalize_layer_bucket(
+            [
+            official_layer_id_to_internal(layer, num_hidden_layers)
+            for layer in official_dynamic_layers
+            ],
+            mature_layer,
+            num_hidden_layers,
+            field_name=f"{dynamic_bucket_name}.official_candidate_premature_layers",
+            allow_embedding_output=True,
+        )
+        configured_internal_layers = dynamic_bucket_config.get("candidate_premature_layers")
+        if configured_internal_layers is not None:
+            normalized_configured_internal_layers = normalize_layer_bucket(
+                [int(layer) for layer in configured_internal_layers],
+                mature_layer,
+                num_hidden_layers,
+                field_name=f"{dynamic_bucket_name}.candidate_premature_layers",
+                allow_embedding_output=any(int(layer) < 0 for layer in configured_internal_layers),
+            )
+            if normalized_configured_internal_layers != dynamic_layers:
+                raise ValueError(
+                    "dynamic_bucket official_candidate_premature_layers and "
+                    "candidate_premature_layers resolve to different internal layers."
+                )
+    else:
+        configured_internal_layers = [int(layer) for layer in dynamic_bucket_config["candidate_premature_layers"]]
+        dynamic_layers = normalize_layer_bucket(
+            configured_internal_layers,
+            mature_layer,
+            num_hidden_layers,
+            field_name=f"{dynamic_bucket_name}.candidate_premature_layers",
+            allow_embedding_output=any(int(layer) < 0 for layer in configured_internal_layers),
+        )
+        official_dynamic_layers = [
+            internal_layer_to_official_layer_id(layer, num_hidden_layers)
+            for layer in dynamic_layers
+        ]
+
+    official_static_layers = config.get("static_layer_candidates_official")
+    raw_static_layers = config.get("static_layer_candidates")
+    if official_static_layers is not None:
+        static_layers = normalize_layer_bucket(
+            [
+            official_layer_id_to_internal(layer, num_hidden_layers)
+            for layer in official_static_layers
+            ],
+            mature_layer,
+            num_hidden_layers,
+            field_name="static_layer_candidates_official",
+            allow_embedding_output=True,
+        )
+        if raw_static_layers is not None:
+            normalized_configured_static_layers = normalize_layer_bucket(
+                [int(layer) for layer in raw_static_layers],
+                mature_layer,
+                num_hidden_layers,
+                field_name="static_layer_candidates",
+                allow_embedding_output=any(int(layer) < 0 for layer in raw_static_layers),
+            )
+            if normalized_configured_static_layers != static_layers:
+                raise ValueError(
+                    "static_layer_candidates_official and static_layer_candidates resolve "
+                    "to different internal layers."
+                )
+    else:
+        if raw_static_layers is None:
+            raise ValueError(
+                "static_layer_candidates_official or static_layer_candidates must contain at least one layer."
+            )
+        static_layers = normalize_layer_bucket(
+            [int(layer) for layer in raw_static_layers],
+            mature_layer,
+            num_hidden_layers,
+            field_name="static_layer_candidates",
+            allow_embedding_output=any(int(layer) < 0 for layer in raw_static_layers),
+        )
+        official_static_layers = [
+            internal_layer_to_official_layer_id(layer, num_hidden_layers)
+            for layer in static_layers
+        ]
+
+    dynamic_bucket_map = {dynamic_bucket_name: dynamic_layers}
     official_mature_layer = int(dynamic_bucket_config.get("official_mature_layer", mature_layer + 1))
     omitted_official_layers = [layer for layer in official_dynamic_layers if layer == 0 and not embedding_inclusive]
 
@@ -277,30 +356,33 @@ def main() -> None:
             "note": str(
                 config.get(
                     "low_bucket_note",
-                    "Current implementation selects transformer block outputs only; official layer 0 "
-                    "(embedding output) is not selectable, so this FACTOR low bucket is approximate.",
+                    "Fully paper-faithful FACTOR low bucket. Official layer 0 maps to the embedding output "
+                    "(hidden_states[0]), and official layers 2..14 map to local block outputs 1..13.",
                 )
             ),
             "official_candidate_premature_layers": official_dynamic_layers,
             "official_mature_layer": official_mature_layer,
-            "candidate_premature_layers": dynamic_layers,
+            "candidate_premature_layers_internal": dynamic_layers,
             "omitted_official_candidate_layers": omitted_official_layers,
         },
         "static_layer_candidates": [
-            {"internal": layer, "official": layer + 1}
+            {
+                "internal": layer,
+                "official": internal_layer_to_official_layer_id(layer, num_hidden_layers),
+            }
             for layer in static_layers
         ],
         "results": {
             "vanilla": vanilla_summary,
             **{
-                f"static_{layer}": summary_payload
+                _static_result_key(layer, num_hidden_layers): summary_payload
                 for layer, summary_payload in static_summaries.items()
             },
             str(config.get("baseline_name", "approx_paper_low_bucket_factor")): dynamic_summary,
         },
         "observed_best_static_low": {
             "internal": best_static_layer,
-            "official": best_static_layer + 1,
+            "official": internal_layer_to_official_layer_id(best_static_layer, num_hidden_layers),
             **best_static_summary,
         },
         "comparisons": {
@@ -330,7 +412,11 @@ def main() -> None:
     _atomic_write_json(summary_path, summary)
     _log(output_dir, f"vanilla accuracy={float(vanilla_summary['accuracy']):.4f}")
     for layer in static_layers:
-        _log(output_dir, f"static_{layer} accuracy={float(static_summaries[layer]['accuracy']):.4f}")
+        _log(
+            output_dir,
+            f"{_static_result_key(layer, num_hidden_layers)} accuracy="
+            f"{float(static_summaries[layer]['accuracy']):.4f}",
+        )
     _log(
         output_dir,
         f"{config.get('baseline_name', 'approx_paper_low_bucket_factor')} accuracy="

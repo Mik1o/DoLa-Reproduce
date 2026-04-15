@@ -391,6 +391,58 @@ def test_multi_config_scoring_matches_single_candidate_paths() -> None:
         assert actual_dynamic_metrics[metric_name] == pytest.approx(expected_dynamic_metrics[metric_name], abs=1e-9)
 
 
+def test_embedding_output_candidate_supported_in_static_and_dynamic_paths() -> None:
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+    prompt = "Answer:"
+    all_candidates = [" Paris", " London", " Rome"]
+
+    static = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        premature_layer=-1,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+    )
+    dynamic = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        premature_layer=-1,
+        score_mode="sum_logprob",
+        dola_score_mode="official_dynamic_dola",
+        candidate_premature_layers=[-1, 1],
+        mature_layer=2,
+    )
+    multi = score_candidate_answers_multi_config_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt=prompt,
+        candidate_answers=all_candidates,
+        static_layers=[-1],
+        dynamic_buckets={"paper_low": [-1, 1]},
+        score_mode="sum_logprob",
+        mature_layer=2,
+        candidate_batch_size=2,
+    )
+
+    for expected, actual in zip(static, multi.static[-1], strict=False):
+        assert actual.candidate == expected.candidate
+        assert actual.continuation_token_count == expected.continuation_token_count
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
+        assert actual.premature_layer_dist == expected.premature_layer_dist
+
+    for expected, actual in zip(dynamic, multi.dynamic["paper_low"], strict=False):
+        assert actual.candidate == expected.candidate
+        assert actual.continuation_token_count == expected.continuation_token_count
+        assert actual.score == pytest.approx(expected.score, abs=1e-6)
+        assert actual.premature_layer_dist == expected.premature_layer_dist
+
+
 
 def test_official_dola_target_token_fast_path_matches_slow_reference() -> None:
     torch = pytest.importorskip("torch")

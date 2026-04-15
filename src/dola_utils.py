@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+EMBEDDING_OUTPUT_LAYER_INDEX = -1
 
 
-def validate_premature_layer(premature_layer: int, num_hidden_layers: int) -> None:
+def is_embedding_output_layer(layer: int) -> bool:
+    """Return whether the internal DoLa layer id points at the embedding output."""
+    return int(layer) == EMBEDDING_OUTPUT_LAYER_INDEX
+
+
+def internal_layer_to_hidden_state_index(layer: int, num_hidden_layers: int) -> int:
+    """Map an internal DoLa layer id to the ``outputs.hidden_states`` tuple index."""
+    if is_embedding_output_layer(layer):
+        return 0
+    validate_mature_layer(layer, num_hidden_layers)
+    return int(layer) + 1
+
+
+def internal_layer_to_official_layer_id(layer: int, num_hidden_layers: int) -> int:
+    """Map an internal DoLa layer id to the official DoLa layer numbering."""
+    if is_embedding_output_layer(layer):
+        return 0
+    validate_mature_layer(layer, num_hidden_layers)
+    if int(layer) == num_hidden_layers - 1:
+        return num_hidden_layers
+    return int(layer) + 1
+
+
+def official_layer_id_to_internal(layer_id: int, num_hidden_layers: int) -> int:
+    """Map an official DoLa layer id to the local internal DoLa layer numbering."""
+    official_layer_id = int(layer_id)
+    if official_layer_id < 0 or official_layer_id > num_hidden_layers:
+        raise ValueError(
+            f"official layer id must be within [0, {num_hidden_layers}]."
+        )
+    if official_layer_id == 0:
+        return EMBEDDING_OUTPUT_LAYER_INDEX
+    return official_layer_id - 1
+
+
+
+def validate_premature_layer(
+    premature_layer: int,
+    num_hidden_layers: int,
+    *,
+    allow_embedding_output: bool = False,
+) -> None:
     """Validate a zero-based premature layer index for DoLa-style scoring."""
     if num_hidden_layers <= 1:
         raise ValueError("num_hidden_layers must be greater than 1 for DoLa-style scoring.")
+    if allow_embedding_output and is_embedding_output_layer(premature_layer):
+        return
     if premature_layer < 0:
         raise ValueError("premature_layer must be a non-negative integer.")
     if premature_layer >= num_hidden_layers - 1:
@@ -37,6 +81,7 @@ def normalize_layer_bucket(
     num_hidden_layers: int,
     *,
     field_name: str = "layer bucket",
+    allow_embedding_output: bool = False,
 ) -> list[int]:
     """Validate a layer bucket, keep first-seen order, and drop later duplicates."""
     validate_mature_layer(mature_layer, num_hidden_layers)
@@ -47,6 +92,11 @@ def normalize_layer_bucket(
     seen: set[int] = set()
     for raw_layer in layers:
         layer = int(raw_layer)
+        if allow_embedding_output and is_embedding_output_layer(layer):
+            if layer not in seen:
+                seen.add(layer)
+                normalized_layers.append(layer)
+            continue
         if layer < 0:
             raise ValueError(f"{field_name} must contain non-negative integers.")
         if layer >= num_hidden_layers:
@@ -66,6 +116,8 @@ def validate_candidate_premature_layers(
     candidate_premature_layers: list[int] | None,
     mature_layer: int,
     num_hidden_layers: int,
+    *,
+    allow_embedding_output: bool = False,
 ) -> list[int]:
     """Validate and normalize candidate premature layers for dynamic DoLa scoring."""
     return normalize_layer_bucket(
@@ -73,6 +125,7 @@ def validate_candidate_premature_layers(
         mature_layer,
         num_hidden_layers,
         field_name="candidate_premature_layers",
+        allow_embedding_output=allow_embedding_output,
     )
 
 
