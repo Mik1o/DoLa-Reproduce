@@ -1,5 +1,5 @@
 task_name: "llama31_8b_factor_low_high_revalidation"
-model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+model_name: "/root/rivermind-data/models/Llama-3.1-8B"
 device: "cuda"
 wiki_csv_path: "data/factor/wiki_factor.csv"
 news_csv_path: "data/factor/news_factor.csv"
