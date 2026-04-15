@@ -464,58 +464,99 @@ def score_candidate_answers_multi_config_with_details(
             mature_probs = mature_log_probs.exp()
             vanilla_scores = _gather_scores_at_target_ids(mature_log_probs, batch_input_ids)
 
-            layer_logits = {
-                layer: lm_head(
-                    hidden_states[
-                        internal_layer_to_hidden_state_index(layer, num_hidden_layers)
-                    ][:, :-1, :]
+            dynamic_layer_memberships: dict[int, list[tuple[str, int]]] = {}
+            for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
+                for layer_index, layer in enumerate(candidate_layers):
+                    dynamic_layer_memberships.setdefault(layer, []).append((bucket_name, layer_index))
+
+            dynamic_best_js: dict[str, Any] = {}
+            dynamic_selected_indices: dict[str, Any] = {
+                bucket_name: torch.zeros(
+                    mature_log_probs.shape[:2],
+                    device=mature_log_probs.device,
+                    dtype=torch.long,
                 )
-                for layer in all_needed_layers
+                for bucket_name in resolved_dynamic_buckets
             }
-            layer_log_probs = {
-                layer: torch.log_softmax(logits, dim=-1)
-                for layer, logits in layer_logits.items()
-            }
-            layer_probs = {
-                layer: log_probs.exp()
-                for layer, log_probs in layer_log_probs.items()
-            }
-            static_start = time.perf_counter()
-            static_scores = {
-                layer: _compute_official_dola_token_scores_from_log_probs(
-                    final_log_probs=mature_log_probs,
-                    base_log_probs=layer_log_probs[layer],
-                    input_ids=batch_input_ids,
-                    post_softmax=post_softmax,
-                    relative_top=relative_top,
-                    relative_top_value=relative_top_value,
+
+            static_scores: dict[int, Any] = {}
+            for layer in all_needed_layers:
+                layer_log_probs = torch.log_softmax(
+                    lm_head(
+                        hidden_states[
+                            internal_layer_to_hidden_state_index(layer, num_hidden_layers)
+                        ][:, :-1, :]
+                    ),
+                    dim=-1,
                 )
-                for layer in resolved_static_layers
-            }
-            static_rescore_sec += time.perf_counter() - static_start
+                if layer in resolved_static_layers:
+                    static_start = time.perf_counter()
+                    static_scores[layer] = _compute_official_dola_token_scores_from_log_probs(
+                        final_log_probs=mature_log_probs,
+                        base_log_probs=layer_log_probs,
+                        input_ids=batch_input_ids,
+                        post_softmax=post_softmax,
+                        relative_top=relative_top,
+                        relative_top_value=relative_top_value,
+                    )
+                    static_rescore_sec += time.perf_counter() - static_start
+                if layer in dynamic_layer_memberships:
+                    dynamic_first_pass_start = time.perf_counter()
+                    layer_js_divergence = _compute_dynamic_js_divergence_from_distributions(
+                        mature_probs=mature_probs,
+                        mature_log_probs=mature_log_probs,
+                        candidate_probs=layer_log_probs.exp().unsqueeze(0),
+                        candidate_log_probs=layer_log_probs.unsqueeze(0),
+                    ).squeeze(0)
+                    for bucket_name, layer_index in dynamic_layer_memberships[layer]:
+                        if bucket_name not in dynamic_best_js:
+                            dynamic_best_js[bucket_name] = layer_js_divergence
+                            dynamic_selected_indices[bucket_name] = torch.full_like(
+                                dynamic_selected_indices[bucket_name],
+                                layer_index,
+                            )
+                            continue
+                        update_mask = layer_js_divergence > dynamic_best_js[bucket_name]
+                        dynamic_best_js[bucket_name] = torch.where(
+                            update_mask,
+                            layer_js_divergence,
+                            dynamic_best_js[bucket_name],
+                        )
+                        dynamic_selected_indices[bucket_name] = torch.where(
+                            update_mask,
+                            torch.full_like(dynamic_selected_indices[bucket_name], layer_index),
+                            dynamic_selected_indices[bucket_name],
+                        )
+                    dynamic_rescore_sec += time.perf_counter() - dynamic_first_pass_start
             dynamic_scores: dict[str, Any] = {}
-            dynamic_selected_indices: dict[str, Any] = {}
-            dynamic_start = time.perf_counter()
             if resolved_dynamic_buckets:
-                dynamic_union_log_probs, dynamic_union_js_divergence = _precompute_union_layer_dynamic_js(
-                    mature_probs=mature_probs,
-                    mature_log_probs=mature_log_probs,
-                    layer_probs=layer_probs,
-                    layer_log_probs=layer_log_probs,
-                    union_layers=dynamic_union_layers,
-                )
-                dynamic_union_log_probs_by_batch = dynamic_union_log_probs.permute(1, 2, 0, 3)
-                dynamic_union_layer_to_index = {
-                    layer: index
-                    for index, layer in enumerate(dynamic_union_layers)
-                }
                 for bucket_name, candidate_layers in resolved_dynamic_buckets.items():
-                    base_log_probs, selected_bucket_indices, _ = _select_dynamic_base_log_probs_from_union(
-                        union_layer_log_probs_by_batch=dynamic_union_log_probs_by_batch,
-                        union_js_divergence=dynamic_union_js_divergence,
-                        union_layer_to_index=dynamic_union_layer_to_index,
-                        candidate_layers=candidate_layers,
-                        return_selected_layers_trace=False,
+                    dynamic_second_pass_start = time.perf_counter()
+                    selected_bucket_indices = dynamic_selected_indices[bucket_name]
+                    base_log_probs = None
+                    for layer_index, layer in enumerate(candidate_layers):
+                        layer_mask = selected_bucket_indices == layer_index
+                        if not bool(layer_mask.any().item()):
+                            continue
+                        layer_log_probs = torch.log_softmax(
+                            lm_head(
+                                hidden_states[
+                                    internal_layer_to_hidden_state_index(layer, num_hidden_layers)
+                                ][:, :-1, :]
+                            ),
+                            dim=-1,
+                        )
+                        if base_log_probs is None:
+                            base_log_probs = layer_log_probs.clone()
+                            continue
+                        base_log_probs = torch.where(
+                            layer_mask.unsqueeze(-1),
+                            layer_log_probs,
+                            base_log_probs,
+                        )
+                    if base_log_probs is None:
+                        raise ValueError(
+                            f"Dynamic bucket '{bucket_name}' did not select any candidate layers."
                     )
                     dynamic_scores[bucket_name] = _compute_official_dola_token_scores_from_log_probs(
                         final_log_probs=mature_log_probs,
@@ -525,8 +566,7 @@ def score_candidate_answers_multi_config_with_details(
                         relative_top=relative_top,
                         relative_top_value=relative_top_value,
                     )
-                    dynamic_selected_indices[bucket_name] = selected_bucket_indices
-            dynamic_rescore_sec += time.perf_counter() - dynamic_start
+                    dynamic_rescore_sec += time.perf_counter() - dynamic_second_pass_start
 
         materialize_start = time.perf_counter()
         for batch_index, candidate_answer in enumerate(batch_candidates):
@@ -1018,18 +1058,43 @@ def _compute_dynamic_js_divergence_from_distributions(
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
 
-    mixture = 0.5 * (mature_probs.unsqueeze(0) + candidate_probs)
-    kl_mature = F.kl_div(
-        mature_log_probs.unsqueeze(0).expand_as(candidate_log_probs),
-        mixture,
-        reduction="none",
-    ).mean(dim=-1)
-    kl_candidate = F.kl_div(
-        candidate_log_probs,
-        mixture,
-        reduction="none",
-    ).mean(dim=-1)
-    return 0.5 * (kl_mature + kl_candidate)
+    vocab_size = int(mature_probs.shape[-1])
+    if vocab_size <= 0:
+        raise ValueError("candidate distributions must have a positive vocabulary dimension.")
+
+    kl_mature_sum = None
+    kl_candidate_sum = None
+    chunk_size = 4096
+
+    for start in range(0, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        mature_probs_chunk = mature_probs[..., start:end]
+        mature_log_probs_chunk = mature_log_probs[..., start:end]
+        candidate_probs_chunk = candidate_probs[..., start:end]
+        candidate_log_probs_chunk = candidate_log_probs[..., start:end]
+        mixture = 0.5 * (mature_probs_chunk.unsqueeze(0) + candidate_probs_chunk)
+
+        current_kl_mature = F.kl_div(
+            mature_log_probs_chunk.unsqueeze(0).expand_as(candidate_log_probs_chunk),
+            mixture,
+            reduction="none",
+        ).sum(dim=-1)
+        current_kl_candidate = F.kl_div(
+            candidate_log_probs_chunk,
+            mixture,
+            reduction="none",
+        ).sum(dim=-1)
+
+        if kl_mature_sum is None:
+            kl_mature_sum = current_kl_mature
+            kl_candidate_sum = current_kl_candidate
+        else:
+            kl_mature_sum = kl_mature_sum + current_kl_mature
+            kl_candidate_sum = kl_candidate_sum + current_kl_candidate
+
+    if kl_mature_sum is None or kl_candidate_sum is None:
+        raise ValueError("Failed to accumulate dynamic JS divergence chunks.")
+    return 0.5 * ((kl_mature_sum / vocab_size) + (kl_candidate_sum / vocab_size))
 
 
 
