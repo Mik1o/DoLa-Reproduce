@@ -13,6 +13,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.analysis_logging import (
+    TruthfulQAMCAnalysisLogger,
+    maybe_create_truthfulqa_mc_analysis_logger,
+)
 from src.dola_utils import (
     describe_dola_pair,
     get_mature_layer_index,
@@ -114,6 +118,7 @@ def evaluate_compare_subset(
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
+    analysis_logger: TruthfulQAMCAnalysisLogger | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float | int | str | dict[str, int] | list[int] | None]]:
     """Evaluate vanilla vs DoLa-style scoring on the first N samples."""
     if max_samples <= 0:
@@ -152,6 +157,7 @@ def evaluate_compare_subset(
     for index, sample in enumerate(subset):
         prompt = build_mc_prompt(sample, prompt_style=prompt_style)
         true_candidates, false_candidates = get_mc_candidate_sets(sample, prompt_style=prompt_style)
+        log_analysis = analysis_logger is not None and analysis_logger.should_log(index)
 
         vanilla_true = score_candidate_answers_with_details(
             model,
@@ -159,6 +165,7 @@ def evaluate_compare_subset(
             prompt,
             true_candidates,
             score_mode=score_mode,
+            return_trace=log_analysis,
         )
         vanilla_false = score_candidate_answers_with_details(
             model,
@@ -166,6 +173,7 @@ def evaluate_compare_subset(
             prompt,
             false_candidates,
             score_mode=score_mode,
+            return_trace=log_analysis,
         )
         vanilla_metrics = compute_mc_metrics(
             [item.score for item in vanilla_true],
@@ -186,6 +194,7 @@ def evaluate_compare_subset(
             relative_top_value=relative_top_value,
             candidate_premature_layers=resolved_candidate_layers,
             mature_layer=resolved_mature_layer,
+            return_trace=log_analysis,
         )
         dola_false = score_candidate_answers_dola_with_details(
             model,
@@ -200,6 +209,7 @@ def evaluate_compare_subset(
             relative_top_value=relative_top_value,
             candidate_premature_layers=resolved_candidate_layers,
             mature_layer=resolved_mature_layer,
+            return_trace=log_analysis,
         )
         dola_metrics = compute_mc_metrics(
             [item.score for item in dola_true],
@@ -239,6 +249,24 @@ def evaluate_compare_subset(
                 },
             }
         )
+        if log_analysis and analysis_logger is not None:
+            analysis_logger.log_sample(
+                sample_idx=index,
+                sample=sample,
+                true_candidates=true_candidates,
+                false_candidates=false_candidates,
+                vanilla_true=vanilla_true,
+                vanilla_false=vanilla_false,
+                dola_true=dola_true,
+                dola_false=dola_false,
+                mature_layer=resolved_mature_layer,
+                num_hidden_layers=num_hidden_layers,
+                premature_layer=premature_layer,
+                candidate_premature_layers=resolved_candidate_layers or None,
+                dola_score_mode=dola_score_mode,
+                score_mode=score_mode,
+            )
+
         if progress_callback is not None:
             progress_callback(
                 {
@@ -295,6 +323,7 @@ def main() -> None:
     mature_layer = None if mature_layer is None else int(mature_layer)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
+    analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
 
     samples = load_truthfulqa_samples(csv_path)
 
@@ -305,6 +334,8 @@ def main() -> None:
     print(f"[hf_eval_compare_subset] Loaded samples: {len(samples)}")
     print(f"[hf_eval_compare_subset] Evaluating first {min(len(samples), max_samples)} samples")
     print(f"[hf_eval_compare_subset] Output directory: {output_dir}")
+    if analysis_logger is not None:
+        print(f"[hf_eval_compare_subset] Analysis log directory: {analysis_logger.log_dir}")
 
     model, tokenizer = load_model_and_tokenizer(
         model_name=model_name,
@@ -326,6 +357,7 @@ def main() -> None:
         relative_top_value=relative_top_value,
         candidate_premature_layers=candidate_premature_layers,
         mature_layer=mature_layer,
+        analysis_logger=analysis_logger,
     )
 
     for result in sample_results:
@@ -370,6 +402,11 @@ def main() -> None:
         )
     print(f"[hf_eval_compare_subset] Saved sample results to: {sample_results_path}")
     print(f"[hf_eval_compare_subset] Saved summary to: {summary_path}")
+    if analysis_logger is not None:
+        print(
+            "[hf_eval_compare_subset] Saved analysis logs to: "
+            f"{analysis_logger.sample_level_path} and {analysis_logger.candidate_level_path}"
+        )
 
 
 if __name__ == "__main__":

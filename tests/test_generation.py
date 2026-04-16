@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import pytest
 
+from src.analysis_logging import (
+    TruthfulQAMCAnalysisLogger,
+    maybe_create_truthfulqa_mc_analysis_logger,
+)
 from src.generation import (
     _aggregate_continuation_log_probs,
     _build_scoring_text_attempts,
@@ -22,6 +27,7 @@ from src.generation import (
     score_candidate_answers_with_details,
 )
 from src.metrics import compute_mc_metrics
+from src.truthfulqa_mc import TruthfulQASample
 
 
 class _FakeTensor:
@@ -648,3 +654,155 @@ def test_multi_config_scoring_matches_single_candidate_paths_for_overlapping_dyn
         assert actual.continuation_token_count == expected.continuation_token_count
         assert actual.score == pytest.approx(expected.score, abs=1e-6)
         assert actual.premature_layer_dist == expected.premature_layer_dist
+
+
+
+
+def test_analysis_logger_disabled_by_default_creates_no_files(tmp_path) -> None:
+    output_dir = tmp_path / "outputs"
+
+    logger = maybe_create_truthfulqa_mc_analysis_logger({}, output_dir=output_dir)
+
+    assert logger is None
+    assert not (output_dir / "analysis_logs").exists()
+
+
+def test_candidate_score_trace_is_opt_in_and_score_preserving() -> None:
+    torch = pytest.importorskip("torch")
+    del torch
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+
+    baseline = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=[" Paris"],
+        score_mode="sum_logprob",
+    )
+    traced = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=[" Paris"],
+        score_mode="sum_logprob",
+        return_trace=True,
+    )
+
+    assert baseline[0].trace is None
+    assert traced[0].trace is not None
+    assert traced[0].score == pytest.approx(baseline[0].score, abs=1e-6)
+    assert traced[0].continuation_token_count == baseline[0].continuation_token_count
+    assert traced[0].trace.token_ids == [2]
+    assert len(traced[0].trace.token_scores) == traced[0].continuation_token_count
+
+
+def test_truthfulqa_analysis_logger_writes_sample_and_candidate_jsonl(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    del torch
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+    sample = TruthfulQASample(
+        question="What is the capital of France?",
+        best_answer="Paris.",
+        correct_answers=["Paris."],
+        incorrect_answers=["Rome."],
+        category=None,
+    )
+    true_candidates = [" Paris"]
+    false_candidates = [" Rome"]
+
+    vanilla_true = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=true_candidates,
+        score_mode="sum_logprob",
+        return_trace=True,
+    )
+    vanilla_false = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=false_candidates,
+        score_mode="sum_logprob",
+        return_trace=True,
+    )
+    dola_true = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=true_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+        return_trace=True,
+    )
+    dola_false = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=false_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+        return_trace=True,
+    )
+
+    logger = TruthfulQAMCAnalysisLogger(tmp_path / "analysis_logs", max_examples=1)
+    assert logger.log_sample(
+        sample_idx=0,
+        sample=sample,
+        true_candidates=true_candidates,
+        false_candidates=false_candidates,
+        vanilla_true=vanilla_true,
+        vanilla_false=vanilla_false,
+        dola_true=dola_true,
+        dola_false=dola_false,
+        mature_layer=2,
+        num_hidden_layers=3,
+        premature_layer=0,
+        candidate_premature_layers=None,
+        dola_score_mode="official_static_dola",
+        score_mode="sum_logprob",
+    )
+
+    sample_records = [json.loads(line) for line in logger.sample_level_path.read_text(encoding="utf-8").splitlines()]
+    candidate_records = [
+        json.loads(line)
+        for line in logger.candidate_level_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert len(sample_records) == 1
+    assert len(candidate_records) == 2
+    assert sample_records[0]["sample_idx"] == 0
+    assert sample_records[0]["mature_layer"] == 2
+    assert sample_records[0]["premature_layer"] == 0
+
+    required_candidate_fields = {
+        "sample_idx",
+        "candidate_idx",
+        "candidate_text",
+        "is_true_candidate",
+        "token_ids",
+        "token_texts",
+        "scoring_start_token_index",
+        "vanilla_token_logprobs",
+        "dola_final_token_scores",
+        "dola_premature_token_scores",
+        "dola_token_contrast_scores",
+        "vanilla_total_score",
+        "vanilla_avg_score",
+        "dola_total_score",
+        "dola_avg_score",
+        "vanilla_rank",
+        "dola_rank",
+    }
+    assert required_candidate_fields <= set(candidate_records[0])
+    assert candidate_records[0]["token_ids"]
+    assert candidate_records[0]["vanilla_token_logprobs"]
+    assert candidate_records[0]["dola_final_token_scores"]
+    assert candidate_records[0]["dola_premature_token_scores"]
+    assert candidate_records[0]["dola_token_contrast_scores"]

@@ -1,0 +1,23 @@
+task_name: "llama31_8b_truthfulqa_mc_analysis_subset"
+model_name: "/root/rivermind-data/models/Llama-3.1-8B"
+model_label: "meta-llama/Llama-3.1-8B (server local copy)"
+device: "cuda"
+torch_dtype: "bfloat16"
+use_fast_tokenizer: false
+trust_remote_code: false
+attn_implementation: "sdpa"
+local_files_only: true
+prompt_style: "official_tfqa_mc"
+score_mode: "sum_logprob"
+dola_score_mode: "official_dynamic_dola"
+csv_path: "data/truthfulqa/TruthfulQA.csv"
+max_samples: 24
+mature_layer: 31
+candidate_premature_layers: [15, 17, 19, 21, 23, 25, 27, 29]
+post_softmax: false
+relative_top: 0.0
+relative_top_value: -1000.0
+output_dir: "outputs/llama31_8b_truthfulqa_mc_analysis_subset"
+enable_analysis_logging: true
+analysis_log_dir: "outputs/analysis_logs/llama31_8b_truthfulqa_mc_analysis_subset"
+analysis_log_max_examples: 24

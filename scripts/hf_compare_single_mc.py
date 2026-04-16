@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.analysis_logging import maybe_create_truthfulqa_mc_analysis_logger
 from src.dola_utils import (
     describe_dola_pair,
     get_mature_layer_index,
@@ -116,6 +117,7 @@ def main() -> None:
     mature_layer = None if mature_layer is None else int(mature_layer)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
+    analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
 
     samples = load_truthfulqa_samples(csv_path)
     if sample_index < 0 or sample_index >= len(samples):
@@ -132,6 +134,8 @@ def main() -> None:
     print(f"[hf_compare_single_mc] Score mode: {score_mode}")
     print(f"[hf_compare_single_mc] DoLa score mode: {dola_score_mode}")
     print(f"[hf_compare_single_mc] Output directory: {output_dir}")
+    if analysis_logger is not None:
+        print(f"[hf_compare_single_mc] Analysis log directory: {analysis_logger.log_dir}")
 
     model, tokenizer = load_model_and_tokenizer(
         model_name=model_name,
@@ -160,12 +164,15 @@ def main() -> None:
         validate_candidate_premature_layers([premature_layer], resolved_mature_layer, num_hidden_layers)
         pair_description = describe_dola_pair(premature_layer, resolved_mature_layer)
 
+    log_analysis = analysis_logger is not None and analysis_logger.should_log(sample_index)
+
     vanilla_true = score_candidate_answers_with_details(
         model,
         tokenizer,
         prompt,
         true_candidates,
         score_mode=score_mode,
+        return_trace=log_analysis,
     )
     vanilla_false = score_candidate_answers_with_details(
         model,
@@ -173,6 +180,7 @@ def main() -> None:
         prompt,
         false_candidates,
         score_mode=score_mode,
+        return_trace=log_analysis,
     )
     vanilla_metrics = compute_mc_metrics(
         [item.score for item in vanilla_true],
@@ -192,6 +200,7 @@ def main() -> None:
         relative_top_value=relative_top_value,
         candidate_premature_layers=resolved_candidate_layers,
         mature_layer=resolved_mature_layer,
+        return_trace=log_analysis,
     )
     dola_false = score_candidate_answers_dola_with_details(
         model,
@@ -206,6 +215,7 @@ def main() -> None:
         relative_top_value=relative_top_value,
         candidate_premature_layers=resolved_candidate_layers,
         mature_layer=resolved_mature_layer,
+        return_trace=log_analysis,
     )
     dola_metrics = compute_mc_metrics(
         [item.score for item in dola_true],
@@ -256,7 +266,30 @@ def main() -> None:
         json.dump(result, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
 
+    if log_analysis and analysis_logger is not None:
+        analysis_logger.log_sample(
+            sample_idx=sample_index,
+            sample=sample,
+            true_candidates=true_candidates,
+            false_candidates=false_candidates,
+            vanilla_true=vanilla_true,
+            vanilla_false=vanilla_false,
+            dola_true=dola_true,
+            dola_false=dola_false,
+            mature_layer=resolved_mature_layer,
+            num_hidden_layers=num_hidden_layers,
+            premature_layer=premature_layer,
+            candidate_premature_layers=resolved_candidate_layers or None,
+            dola_score_mode=dola_score_mode,
+            score_mode=score_mode,
+        )
+
     print(f"[hf_compare_single_mc] Saved comparison to: {output_path}")
+    if analysis_logger is not None:
+        print(
+            "[hf_compare_single_mc] Saved analysis logs to: "
+            f"{analysis_logger.sample_level_path} and {analysis_logger.candidate_level_path}"
+        )
 
 
 if __name__ == "__main__":

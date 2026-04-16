@@ -71,11 +71,25 @@ def _forward_hidden_states_only(
 
 
 @dataclass(slots=True)
+class CandidateScoreTrace:
+    token_ids: list[int]
+    token_texts: list[str]
+    scoring_start_token_index: int
+    token_scores: list[float]
+    total_score: float
+    avg_score: float
+    final_token_scores: list[float] | None = None
+    premature_token_scores: list[float] | None = None
+    selected_premature_layers: list[int] | None = None
+
+
+@dataclass(slots=True)
 class CandidateScore:
     candidate: str
     score: float
     continuation_token_count: int
     premature_layer_dist: dict[int, int] | None = None
+    trace: CandidateScoreTrace | None = None
 
 
 @dataclass(slots=True)
@@ -164,6 +178,7 @@ def score_candidate_answers_with_details(
     candidate_answers: list[str],
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    return_trace: bool = False,
 ) -> list[CandidateScore]:
     """Score each candidate answer and keep continuation token counts."""
     if not candidate_answers:
@@ -177,6 +192,7 @@ def score_candidate_answers_with_details(
             candidate_answer=candidate_answer,
             separator=separator,
             score_mode=score_mode,
+            return_trace=return_trace,
         )
         for candidate_answer in candidate_answers
     ]
@@ -190,6 +206,7 @@ def score_continuation_details(
     candidate_answer: str,
     separator: str = " ",
     score_mode: str = "sum_logprob",
+    return_trace: bool = False,
 ) -> CandidateScore:
     """Score one candidate continuation and return score plus token length."""
     try:
@@ -216,12 +233,26 @@ def score_continuation_details(
         logits = outputs.logits[:, :-1, :]
         token_log_probs = _gather_token_log_probs(logits, input_ids)
 
-    continuation_log_probs = token_log_probs[:, _get_continuation_start_index(prompt_len) :]
+    continuation_start = _get_continuation_start_index(prompt_len)
+    continuation_log_probs = token_log_probs[:, continuation_start:]
     score, continuation_token_count = _aggregate_continuation_log_probs(
         continuation_log_probs=continuation_log_probs,
         score_mode=score_mode,
     )
-    return CandidateScore(candidate=candidate_answer, score=score, continuation_token_count=continuation_token_count)
+    trace = None
+    if return_trace:
+        trace = _build_candidate_score_trace(
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            scoring_score_start_index=continuation_start,
+            token_scores=continuation_log_probs,
+        )
+    return CandidateScore(
+        candidate=candidate_answer,
+        score=score,
+        continuation_token_count=continuation_token_count,
+        trace=trace,
+    )
 
 
 
@@ -310,6 +341,7 @@ def score_candidate_answers_dola_with_details(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    return_trace: bool = False,
 ) -> list[CandidateScore]:
     """Score each candidate answer with DoLa-style scoring and token counts."""
     if not candidate_answers:
@@ -330,6 +362,7 @@ def score_candidate_answers_dola_with_details(
             relative_top_value=relative_top_value,
             candidate_premature_layers=candidate_premature_layers,
             mature_layer=mature_layer,
+            return_trace=return_trace,
         )
         for candidate_answer in candidate_answers
     ]
@@ -667,6 +700,7 @@ def score_continuation_dola_details(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    return_trace: bool = False,
 ) -> CandidateScore:
     """Score one candidate with configurable DoLa-style scoring and token counts.
 
@@ -730,6 +764,9 @@ def score_continuation_dola_details(
         ]
         mature_logits = lm_head(mature_hidden[:, :-1, :])
 
+        final_target_scores = None
+        premature_target_scores = None
+
         if normalized_dola_mode == "legacy_contrastive":
             premature_hidden = hidden_states[
                 internal_layer_to_hidden_state_index(resolved_premature_layer, num_hidden_layers)
@@ -777,6 +814,15 @@ def score_continuation_dola_details(
                 relative_top_value=relative_top_value,
             )
 
+        if return_trace:
+            mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+            final_target_scores = _gather_scores_at_target_ids(mature_log_probs, input_ids)
+            if normalized_dola_mode in {"legacy_contrastive", "official_static_dola"}:
+                base_log_probs = torch.log_softmax(premature_logits, dim=-1)
+            else:
+                base_log_probs = torch.log_softmax(base_logits, dim=-1)
+            premature_target_scores = _gather_scores_at_target_ids(base_log_probs, input_ids)
+
     continuation_start = _get_continuation_start_index(prompt_len)
     continuation_scores = token_scores[:, continuation_start:]
     score, continuation_token_count = _aggregate_continuation_log_probs(
@@ -787,11 +833,30 @@ def score_continuation_dola_details(
         selected_layers[continuation_start:],
         resolved_candidate_layers if resolved_candidate_layers else [resolved_premature_layer],
     )
+    trace = None
+    if return_trace:
+        continuation_token_count_for_trace = int(continuation_scores.shape[-1])
+        trace = _build_candidate_score_trace(
+            tokenizer=tokenizer,
+            input_ids=input_ids,
+            scoring_score_start_index=continuation_start,
+            token_scores=continuation_scores,
+            final_token_scores=None
+            if final_target_scores is None
+            else final_target_scores[:, continuation_start:],
+            premature_token_scores=None
+            if premature_target_scores is None
+            else premature_target_scores[:, continuation_start:],
+            selected_premature_layers=selected_layers[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+        )
     return CandidateScore(
         candidate=candidate_answer,
         score=score,
         continuation_token_count=continuation_token_count,
         premature_layer_dist=premature_layer_dist or None,
+        trace=trace,
     )
 
 
@@ -1365,6 +1430,97 @@ def _slice_continuation_scores(
     continuation_start = _get_continuation_start_index(prompt_len)
     return token_scores[:, continuation_start:valid_target_length]
 
+
+
+def _build_candidate_score_trace(
+    *,
+    tokenizer: Any,
+    input_ids: Any,
+    scoring_score_start_index: int,
+    token_scores: Any,
+    final_token_scores: Any | None = None,
+    premature_token_scores: Any | None = None,
+    selected_premature_layers: list[int] | None = None,
+) -> CandidateScoreTrace:
+    """Materialize JSON-friendly token-level scoring details on demand."""
+    token_score_values = _tensor_first_row_to_float_list(token_scores)
+    token_count = len(token_score_values)
+    target_token_ids = input_ids[:, 1:]
+    scored_target_ids = target_token_ids[
+        :, scoring_score_start_index : scoring_score_start_index + token_count
+    ]
+    token_ids = _tensor_first_row_to_int_list(scored_target_ids)
+    total_score = float(sum(token_score_values))
+    avg_score = float(total_score / token_count) if token_count else 0.0
+
+    return CandidateScoreTrace(
+        token_ids=token_ids,
+        token_texts=_token_ids_to_texts(tokenizer, token_ids),
+        scoring_start_token_index=int(scoring_score_start_index + 1),
+        token_scores=token_score_values,
+        total_score=total_score,
+        avg_score=avg_score,
+        final_token_scores=None
+        if final_token_scores is None
+        else _tensor_first_row_to_float_list(final_token_scores),
+        premature_token_scores=None
+        if premature_token_scores is None
+        else _tensor_first_row_to_float_list(premature_token_scores),
+        selected_premature_layers=None
+        if selected_premature_layers is None
+        else [int(layer) for layer in selected_premature_layers],
+    )
+
+
+def _tensor_first_row_to_float_list(values: Any) -> list[float]:
+    raw_values = _tensor_first_row_to_plain_list(values)
+    return [float(value) for value in raw_values]
+
+
+def _tensor_first_row_to_int_list(values: Any) -> list[int]:
+    raw_values = _tensor_first_row_to_plain_list(values)
+    return [int(value) for value in raw_values]
+
+
+def _tensor_first_row_to_plain_list(values: Any) -> list[Any]:
+    if hasattr(values, "detach"):
+        raw_values = values.detach().cpu().tolist()
+    elif hasattr(values, "tolist"):
+        raw_values = values.tolist()
+    else:
+        raw_values = list(values)
+    if raw_values and isinstance(raw_values[0], list):
+        raw_values = raw_values[0]
+    return list(raw_values)
+
+
+def _token_ids_to_texts(tokenizer: Any, token_ids: list[int]) -> list[str]:
+    if not token_ids:
+        return []
+
+    convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
+    if callable(convert_ids_to_tokens):
+        try:
+            tokens = convert_ids_to_tokens(token_ids)
+            if isinstance(tokens, str):
+                return [tokens]
+            return [str(token) for token in tokens]
+        except Exception:
+            pass
+
+    decode = getattr(tokenizer, "decode", None)
+    if callable(decode):
+        texts: list[str] = []
+        for token_id in token_ids:
+            try:
+                texts.append(str(decode([token_id], skip_special_tokens=False)))
+            except TypeError:
+                texts.append(str(decode([token_id])))
+            except Exception:
+                texts.append(str(token_id))
+        return texts
+
+    return [str(token_id) for token_id in token_ids]
 
 
 def _aggregate_continuation_log_probs(
