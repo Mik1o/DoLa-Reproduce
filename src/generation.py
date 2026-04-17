@@ -80,7 +80,11 @@ class CandidateScoreTrace:
     avg_score: float
     final_token_scores: list[float] | None = None
     premature_token_scores: list[float] | None = None
+    contrast_token_scores: list[float] | None = None
     selected_premature_layers: list[int] | None = None
+    token_selected_mask: list[bool] | None = None
+    token_selected_reason: list[str] | None = None
+    token_effective_score_source: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -100,6 +104,85 @@ class MultiConfigScoreResult:
     batch_size: int
     batch_count: int
     profile: dict[str, Any] | None = None
+
+
+TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1 = "heuristic_fact_critical_v1"
+
+_TOKEN_SELECTIVE_DATE_WORDS = {
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+}
+
+_TOKEN_SELECTIVE_RELATION_WORDS = {
+    "author",
+    "born",
+    "called",
+    "capital",
+    "city",
+    "country",
+    "died",
+    "discovered",
+    "invented",
+    "king",
+    "known",
+    "located",
+    "president",
+    "queen",
+    "state",
+    "wrote",
+}
+
+_TOKEN_SELECTIVE_CAPITALIZED_EXCLUSIONS = {
+    "A",
+    "An",
+    "And",
+    "As",
+    "At",
+    "But",
+    "For",
+    "He",
+    "Her",
+    "His",
+    "I",
+    "In",
+    "It",
+    "It's",
+    "No",
+    "Of",
+    "On",
+    "Or",
+    "She",
+    "The",
+    "They",
+    "This",
+    "To",
+    "We",
+    "What",
+    "When",
+    "Where",
+    "Which",
+    "Who",
+    "Why",
+    "Yes",
+    "You",
+}
 
 
 
@@ -270,6 +353,8 @@ def score_continuation_dola_logprob(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    enable_token_selective_dola: bool = False,
+    token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
 ) -> float:
     """Score a continuation with configurable DoLa-style scoring."""
     return score_continuation_dola_details(
@@ -286,6 +371,8 @@ def score_continuation_dola_logprob(
         relative_top_value=relative_top_value,
         candidate_premature_layers=candidate_premature_layers,
         mature_layer=mature_layer,
+        enable_token_selective_dola=enable_token_selective_dola,
+        token_selective_mode=token_selective_mode,
     ).score
 
 
@@ -304,6 +391,8 @@ def score_candidate_answers_dola(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    enable_token_selective_dola: bool = False,
+    token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
 ) -> list[tuple[str, float]]:
     """Score each candidate answer with configurable DoLa-style scoring."""
     return [
@@ -322,6 +411,8 @@ def score_candidate_answers_dola(
             relative_top_value=relative_top_value,
             candidate_premature_layers=candidate_premature_layers,
             mature_layer=mature_layer,
+            enable_token_selective_dola=enable_token_selective_dola,
+            token_selective_mode=token_selective_mode,
         )
     ]
 
@@ -342,6 +433,8 @@ def score_candidate_answers_dola_with_details(
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
     return_trace: bool = False,
+    enable_token_selective_dola: bool = False,
+    token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
 ) -> list[CandidateScore]:
     """Score each candidate answer with DoLa-style scoring and token counts."""
     if not candidate_answers:
@@ -363,6 +456,8 @@ def score_candidate_answers_dola_with_details(
             candidate_premature_layers=candidate_premature_layers,
             mature_layer=mature_layer,
             return_trace=return_trace,
+            enable_token_selective_dola=enable_token_selective_dola,
+            token_selective_mode=token_selective_mode,
         )
         for candidate_answer in candidate_answers
     ]
@@ -701,6 +796,8 @@ def score_continuation_dola_details(
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
     return_trace: bool = False,
+    enable_token_selective_dola: bool = False,
+    token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
 ) -> CandidateScore:
     """Score one candidate with configurable DoLa-style scoring and token counts.
 
@@ -730,6 +827,11 @@ def score_continuation_dola_details(
     num_hidden_layers = int(getattr(model.config, "num_hidden_layers", 0))
     resolved_mature_layer = _resolve_mature_layer(mature_layer, num_hidden_layers)
     normalized_dola_mode = _normalize_dola_score_mode(dola_score_mode)
+    normalized_token_selective_mode = (
+        _normalize_token_selective_mode(token_selective_mode)
+        if enable_token_selective_dola
+        else TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1
+    )
     resolved_premature_layer: int | None = None
     resolved_candidate_layers: list[int] = []
 
@@ -766,6 +868,10 @@ def score_continuation_dola_details(
 
         final_target_scores = None
         premature_target_scores = None
+        contrast_token_scores = None
+        token_selected_mask: list[bool] | None = None
+        token_selected_reason: list[str] | None = None
+        token_effective_score_source: list[str] | None = None
 
         if normalized_dola_mode == "legacy_contrastive":
             premature_hidden = hidden_states[
@@ -814,14 +920,34 @@ def score_continuation_dola_details(
                 relative_top_value=relative_top_value,
             )
 
-        if return_trace:
+        if enable_token_selective_dola:
             mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
             final_target_scores = _gather_scores_at_target_ids(mature_log_probs, input_ids)
+            contrast_token_scores = token_scores
+            (
+                token_scores,
+                token_selected_mask,
+                token_selected_reason,
+                token_effective_score_source,
+            ) = _apply_token_selective_dola_scores(
+                tokenizer=tokenizer,
+                input_ids=input_ids,
+                contrast_token_scores=contrast_token_scores,
+                final_token_scores=final_target_scores,
+                token_selective_mode=normalized_token_selective_mode,
+            )
+
+        if return_trace:
+            if final_target_scores is None:
+                mature_log_probs = torch.log_softmax(mature_logits, dim=-1)
+                final_target_scores = _gather_scores_at_target_ids(mature_log_probs, input_ids)
             if normalized_dola_mode in {"legacy_contrastive", "official_static_dola"}:
                 base_log_probs = torch.log_softmax(premature_logits, dim=-1)
             else:
                 base_log_probs = torch.log_softmax(base_logits, dim=-1)
             premature_target_scores = _gather_scores_at_target_ids(base_log_probs, input_ids)
+            if contrast_token_scores is None:
+                contrast_token_scores = token_scores
 
     continuation_start = _get_continuation_start_index(prompt_len)
     continuation_scores = token_scores[:, continuation_start:]
@@ -847,7 +973,25 @@ def score_continuation_dola_details(
             premature_token_scores=None
             if premature_target_scores is None
             else premature_target_scores[:, continuation_start:],
+            contrast_token_scores=None
+            if contrast_token_scores is None
+            else contrast_token_scores[:, continuation_start:],
             selected_premature_layers=selected_layers[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+            token_selected_mask=None
+            if token_selected_mask is None
+            else token_selected_mask[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+            token_selected_reason=None
+            if token_selected_reason is None
+            else token_selected_reason[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+            token_effective_score_source=None
+            if token_effective_score_source is None
+            else token_effective_score_source[
                 continuation_start : continuation_start + continuation_token_count_for_trace
             ],
         )
@@ -1440,7 +1584,11 @@ def _build_candidate_score_trace(
     token_scores: Any,
     final_token_scores: Any | None = None,
     premature_token_scores: Any | None = None,
+    contrast_token_scores: Any | None = None,
     selected_premature_layers: list[int] | None = None,
+    token_selected_mask: list[bool] | None = None,
+    token_selected_reason: list[str] | None = None,
+    token_effective_score_source: list[str] | None = None,
 ) -> CandidateScoreTrace:
     """Materialize JSON-friendly token-level scoring details on demand."""
     token_score_values = _tensor_first_row_to_float_list(token_scores)
@@ -1466,9 +1614,21 @@ def _build_candidate_score_trace(
         premature_token_scores=None
         if premature_token_scores is None
         else _tensor_first_row_to_float_list(premature_token_scores),
+        contrast_token_scores=None
+        if contrast_token_scores is None
+        else _tensor_first_row_to_float_list(contrast_token_scores),
         selected_premature_layers=None
         if selected_premature_layers is None
         else [int(layer) for layer in selected_premature_layers],
+        token_selected_mask=None
+        if token_selected_mask is None
+        else [bool(selected) for selected in token_selected_mask],
+        token_selected_reason=None
+        if token_selected_reason is None
+        else [str(reason) for reason in token_selected_reason],
+        token_effective_score_source=None
+        if token_effective_score_source is None
+        else [str(source) for source in token_effective_score_source],
     )
 
 
@@ -1523,6 +1683,102 @@ def _token_ids_to_texts(tokenizer: Any, token_ids: list[int]) -> list[str]:
     return [str(token_id) for token_id in token_ids]
 
 
+def _apply_token_selective_dola_scores(
+    *,
+    tokenizer: Any,
+    input_ids: Any,
+    contrast_token_scores: Any,
+    final_token_scores: Any,
+    token_selective_mode: str,
+) -> tuple[Any, list[bool], list[str], list[str]]:
+    """Mix DoLa contrast scores only onto conservatively selected target tokens."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch is required for token-selective DoLa scoring. "
+            "Install the extra model dependencies from requirements-model.txt."
+        ) from error
+
+    normalized_mode = _normalize_token_selective_mode(token_selective_mode)
+    if normalized_mode != TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1:
+        raise ValueError(f"Unsupported token_selective_mode '{token_selective_mode}'.")
+
+    target_token_ids = _tensor_first_row_to_int_list(input_ids[:, 1:])
+    target_token_texts = _token_ids_to_texts(tokenizer, target_token_ids)
+    selected_mask, selected_reasons = _select_token_selective_dola_tokens(target_token_texts)
+    mask_tensor = torch.tensor(
+        [selected_mask],
+        dtype=torch.bool,
+        device=contrast_token_scores.device,
+    )
+    effective_scores = torch.where(mask_tensor, contrast_token_scores, final_token_scores)
+    score_sources = [
+        "contrast" if selected else "vanilla_final"
+        for selected in selected_mask
+    ]
+    return effective_scores, selected_mask, selected_reasons, score_sources
+
+
+def _select_token_selective_dola_tokens(token_texts: list[str]) -> tuple[list[bool], list[str]]:
+    """Return conservative token-selection decisions for token-selective DoLa v1."""
+    selected_mask: list[bool] = []
+    selected_reasons: list[str] = []
+    for token_index, token_text in enumerate(token_texts):
+        selected, reason = _select_token_for_token_selective_dola(token_text, token_index=token_index)
+        selected_mask.append(selected)
+        selected_reasons.append(reason)
+    return selected_mask, selected_reasons
+
+
+def _select_token_for_token_selective_dola(token_text: str, *, token_index: int = 0) -> tuple[bool, str]:
+    """Conservative lexical selector for fact-critical-ish answer tokens."""
+    clean_token = _clean_token_for_token_selective_dola(token_text)
+    stripped = clean_token.strip(" \t\r\n\"'`.,;:!?()[]{}")
+    if not stripped:
+        return False, ""
+
+    lower = stripped.lower()
+    if any(char.isdigit() for char in stripped):
+        return True, "number"
+    if lower in _TOKEN_SELECTIVE_DATE_WORDS:
+        return True, "date_word"
+    if lower in _TOKEN_SELECTIVE_RELATION_WORDS:
+        return True, "relation_word"
+    if _is_conservative_capitalized_token(token_text, stripped, token_index=token_index):
+        return True, "capitalized_lexical"
+    return False, ""
+
+
+def _clean_token_for_token_selective_dola(token_text: str) -> str:
+    """Remove common tokenizer word-boundary markers without joining subwords."""
+    return (
+        str(token_text)
+        .replace("Ġ", "")
+        .replace("▁", "")
+        .replace("Ċ", "")
+        .strip()
+    )
+
+
+def _is_conservative_capitalized_token(
+    raw_token: str,
+    stripped_token: str,
+    *,
+    token_index: int,
+) -> bool:
+    """Select only lexical uppercase word starts, not arbitrary subword fragments."""
+    if stripped_token in _TOKEN_SELECTIVE_CAPITALIZED_EXCLUSIONS:
+        return False
+    if not stripped_token[:1].isupper():
+        return False
+    if sum(1 for char in stripped_token if char.isalpha()) < 2:
+        return False
+    if token_index > 0 and not str(raw_token).startswith(("Ġ", "▁")):
+        return False
+    return True
+
+
 def _aggregate_continuation_log_probs(
     continuation_log_probs: Any,
     score_mode: str,
@@ -1562,6 +1818,17 @@ def _normalize_dola_score_mode(dola_score_mode: str) -> str:
         raise ValueError(
             "Unsupported dola_score_mode "
             f"'{dola_score_mode}'. Use 'legacy_contrastive', 'official_static_dola', or 'official_dynamic_dola'."
+        )
+    return normalized_mode
+
+
+def _normalize_token_selective_mode(token_selective_mode: str) -> str:
+    """Normalize the opt-in token-selective DoLa selector mode."""
+    normalized_mode = token_selective_mode.strip().lower()
+    if normalized_mode != TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1:
+        raise ValueError(
+            "Unsupported token_selective_mode "
+            f"'{token_selective_mode}'. Use '{TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1}'."
         )
     return normalized_mode
 

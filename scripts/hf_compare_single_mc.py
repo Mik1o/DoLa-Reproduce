@@ -115,6 +115,8 @@ def main() -> None:
     candidate_premature_layers = [int(layer) for layer in config.get("candidate_premature_layers", [])]
     mature_layer = config.get("mature_layer")
     mature_layer = None if mature_layer is None else int(mature_layer)
+    enable_token_selective_dola = bool(config.get("enable_token_selective_dola", False))
+    token_selective_mode = str(config.get("token_selective_mode", "heuristic_fact_critical_v1"))
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
     analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
@@ -133,6 +135,9 @@ def main() -> None:
     print(f"[hf_compare_single_mc] Device: {device}")
     print(f"[hf_compare_single_mc] Score mode: {score_mode}")
     print(f"[hf_compare_single_mc] DoLa score mode: {dola_score_mode}")
+    print(f"[hf_compare_single_mc] Token-selective DoLa: {enable_token_selective_dola}")
+    if enable_token_selective_dola:
+        print(f"[hf_compare_single_mc] Token-selective mode: {token_selective_mode}")
     print(f"[hf_compare_single_mc] Output directory: {output_dir}")
     if analysis_logger is not None:
         print(f"[hf_compare_single_mc] Analysis log directory: {analysis_logger.log_dir}")
@@ -201,6 +206,8 @@ def main() -> None:
         candidate_premature_layers=resolved_candidate_layers,
         mature_layer=resolved_mature_layer,
         return_trace=log_analysis,
+        enable_token_selective_dola=enable_token_selective_dola,
+        token_selective_mode=token_selective_mode,
     )
     dola_false = score_candidate_answers_dola_with_details(
         model,
@@ -216,6 +223,8 @@ def main() -> None:
         candidate_premature_layers=resolved_candidate_layers,
         mature_layer=resolved_mature_layer,
         return_trace=log_analysis,
+        enable_token_selective_dola=enable_token_selective_dola,
+        token_selective_mode=token_selective_mode,
     )
     dola_metrics = compute_mc_metrics(
         [item.score for item in dola_true],
@@ -248,6 +257,8 @@ def main() -> None:
         "premature_layer": premature_layer,
         "candidate_premature_layers": resolved_candidate_layers or None,
         "mature_layer": resolved_mature_layer,
+        "enable_token_selective_dola": enable_token_selective_dola,
+        "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
         "vanilla": {
             "true_scores": _serialize_candidate_scores(vanilla_true),
             "false_scores": _serialize_candidate_scores(vanilla_false),

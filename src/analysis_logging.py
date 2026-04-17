@@ -176,29 +176,44 @@ def build_truthfulqa_mc_analysis_records(
         vanilla_total, vanilla_avg = _total_and_avg(vanilla_item, score_mode)
         dola_total, dola_avg = _total_and_avg(dola_item, score_mode)
 
-        candidate_records.append(
-            {
-                "sample_idx": int(sample_idx),
-                "candidate_idx": int(candidate_idx),
-                "candidate_text": candidate_text,
-                "is_true_candidate": bool(is_true),
-                "token_ids": token_ids,
-                "token_texts": token_texts,
-                "scoring_start_token_index": scoring_start,
-                "vanilla_token_logprobs": _trace_list(vanilla_trace, "token_scores"),
-                "dola_final_token_scores": _trace_list(dola_trace, "final_token_scores"),
-                "dola_premature_token_scores": _trace_list(dola_trace, "premature_token_scores"),
-                "dola_token_contrast_scores": _trace_list(dola_trace, "token_scores"),
-                "vanilla_total_score": vanilla_total,
-                "vanilla_avg_score": vanilla_avg,
-                "dola_total_score": dola_total,
-                "dola_avg_score": dola_avg,
-                "vanilla_rank": int(vanilla_ranks[candidate_idx]),
-                "dola_rank": int(dola_ranks[candidate_idx]),
-                "selected_premature_layers": _trace_list(dola_trace, "selected_premature_layers"),
-                "premature_layer_dist": _serialize_layer_dist(dola_item.premature_layer_dist),
-            }
-        )
+        candidate_record = {
+            "sample_idx": int(sample_idx),
+            "candidate_idx": int(candidate_idx),
+            "candidate_text": candidate_text,
+            "is_true_candidate": bool(is_true),
+            "token_ids": token_ids,
+            "token_texts": token_texts,
+            "scoring_start_token_index": scoring_start,
+            "vanilla_token_logprobs": _trace_list(vanilla_trace, "token_scores"),
+            "dola_final_token_scores": _trace_list(dola_trace, "final_token_scores"),
+            "dola_premature_token_scores": _trace_list(dola_trace, "premature_token_scores"),
+            "dola_token_contrast_scores": _trace_list(
+                dola_trace,
+                "contrast_token_scores",
+                fallback_field_name="token_scores",
+            ),
+            "vanilla_total_score": vanilla_total,
+            "vanilla_avg_score": vanilla_avg,
+            "dola_total_score": dola_total,
+            "dola_avg_score": dola_avg,
+            "vanilla_rank": int(vanilla_ranks[candidate_idx]),
+            "dola_rank": int(dola_ranks[candidate_idx]),
+            "selected_premature_layers": _trace_list(dola_trace, "selected_premature_layers"),
+            "premature_layer_dist": _serialize_layer_dist(dola_item.premature_layer_dist),
+        }
+        if _trace_value(dola_trace, "token_selected_mask") is not None:
+            candidate_record.update(
+                {
+                    "dola_token_effective_scores": _trace_list(dola_trace, "token_scores"),
+                    "token_selected_mask": _trace_list(dola_trace, "token_selected_mask"),
+                    "token_selected_reason": _trace_list(dola_trace, "token_selected_reason"),
+                    "token_effective_score_source": _trace_list(
+                        dola_trace,
+                        "token_effective_score_source",
+                    ),
+                }
+            )
+        candidate_records.append(candidate_record)
 
     return sample_record, candidate_records
 
@@ -240,8 +255,15 @@ def _trace_value(trace: Any | None, field_name: str) -> Any:
     return getattr(trace, field_name)
 
 
-def _trace_list(trace: Any | None, field_name: str) -> list[Any]:
+def _trace_list(
+    trace: Any | None,
+    field_name: str,
+    *,
+    fallback_field_name: str | None = None,
+) -> list[Any]:
     value = _trace_value(trace, field_name)
+    if value is None and fallback_field_name is not None:
+        value = _trace_value(trace, fallback_field_name)
     if value is None:
         return []
     return list(value)

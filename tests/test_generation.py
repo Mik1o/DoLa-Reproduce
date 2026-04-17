@@ -11,6 +11,7 @@ from src.analysis_logging import (
 )
 from src.generation import (
     _aggregate_continuation_log_probs,
+    _apply_token_selective_dola_scores,
     _build_scoring_text_attempts,
     _compute_dynamic_js_divergence_from_distributions,
     _compute_official_dola_token_scores_from_log_probs,
@@ -21,6 +22,7 @@ from src.generation import (
     _normalize_dola_score_mode,
     _prepare_scoring_inputs,
     _precompute_union_layer_dynamic_js,
+    _select_token_selective_dola_tokens,
     _select_dynamic_base_log_probs_from_union,
     score_candidate_answers_dola_with_details,
     score_candidate_answers_multi_config_with_details,
@@ -229,6 +231,50 @@ def test_normalize_dola_score_mode_accepts_official_modes() -> None:
     assert _normalize_dola_score_mode("official_dynamic_dola") == "official_dynamic_dola"
 
 
+def test_token_selective_selector_keeps_only_conservative_fact_like_tokens() -> None:
+    """The v1 selector should be conservative and easy to inspect."""
+    mask, reasons = _select_token_selective_dola_tokens(
+        ["ĠParis", "Ġ2024", "ĠJanuary", "Ġcapital", "Ġthe", "ing"]
+    )
+
+    assert mask == [True, True, True, True, False, False]
+    assert reasons == [
+        "capitalized_lexical",
+        "number",
+        "date_word",
+        "relation_word",
+        "",
+        "",
+    ]
+
+
+def test_token_selective_mixing_uses_contrast_only_for_selected_tokens() -> None:
+    """Selected tokens should use contrast; unselected tokens should use final scores."""
+    torch = pytest.importorskip("torch")
+
+    class _SelectorTokenizer:
+        def convert_ids_to_tokens(self, token_ids):
+            mapping = {1: "Prompt", 2: "ĠParis", 3: "Ġthe", 4: "Ġ2024"}
+            return [mapping[int(token_id)] for token_id in token_ids]
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    contrast_scores = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32)
+    final_scores = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+
+    mixed_scores, mask, reasons, sources = _apply_token_selective_dola_scores(
+        tokenizer=_SelectorTokenizer(),
+        input_ids=input_ids,
+        contrast_token_scores=contrast_scores,
+        final_token_scores=final_scores,
+        token_selective_mode="heuristic_fact_critical_v1",
+    )
+
+    torch.testing.assert_close(mixed_scores, torch.tensor([[10.0, 2.0, 30.0]]))
+    assert mask == [True, False, True]
+    assert reasons == ["capitalized_lexical", "", "number"]
+    assert sources == ["contrast", "vanilla_final", "contrast"]
+
+
 class _ToyTokenizer:
     pad_token_id = 0
     eos_token_id = 0
@@ -242,6 +288,7 @@ class _ToyTokenizer:
             "Rome": 4,
             "Berlin": 5,
         }
+        self._inverse_vocab = {token_id: token for token, token_id in self._vocab.items()}
 
     def __call__(
         self,
@@ -259,6 +306,11 @@ class _ToyTokenizer:
         input_ids = torch.tensor([token_ids], dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
         return {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    def convert_ids_to_tokens(self, token_ids):
+        if isinstance(token_ids, int):
+            return self._inverse_vocab[token_ids]
+        return [self._inverse_vocab[int(token_id)] for token_id in token_ids]
 
 
 class _ToyOutput:
@@ -657,6 +709,40 @@ def test_multi_config_scoring_matches_single_candidate_paths_for_overlapping_dyn
 
 
 
+def test_token_selective_dola_disabled_preserves_original_dola_scores() -> None:
+    torch = pytest.importorskip("torch")
+    del torch
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+
+    default_scores = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=[" Paris", " Rome"],
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+    )
+    explicit_disabled_scores = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=[" Paris", " Rome"],
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+        enable_token_selective_dola=False,
+    )
+
+    for expected, actual in zip(default_scores, explicit_disabled_scores, strict=True):
+        assert actual.candidate == expected.candidate
+        assert actual.score == pytest.approx(expected.score, abs=1e-9)
+        assert actual.continuation_token_count == expected.continuation_token_count
+
+
 
 def test_analysis_logger_disabled_by_default_creates_no_files(tmp_path) -> None:
     output_dir = tmp_path / "outputs"
@@ -806,3 +892,88 @@ def test_truthfulqa_analysis_logger_writes_sample_and_candidate_jsonl(tmp_path) 
     assert candidate_records[0]["dola_final_token_scores"]
     assert candidate_records[0]["dola_premature_token_scores"]
     assert candidate_records[0]["dola_token_contrast_scores"]
+
+
+def test_truthfulqa_analysis_logger_writes_token_selective_fields(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+    del torch
+    model = _ToyModel()
+    tokenizer = _ToyTokenizer()
+    sample = TruthfulQASample(
+        question="What is the capital of France?",
+        best_answer="Paris.",
+        correct_answers=["Paris."],
+        incorrect_answers=["Rome."],
+        category=None,
+    )
+    true_candidates = [" Paris"]
+    false_candidates = [" Rome"]
+
+    vanilla_true = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=true_candidates,
+        score_mode="sum_logprob",
+        return_trace=True,
+    )
+    vanilla_false = score_candidate_answers_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=false_candidates,
+        score_mode="sum_logprob",
+        return_trace=True,
+    )
+    dola_true = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=true_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+        return_trace=True,
+        enable_token_selective_dola=True,
+    )
+    dola_false = score_candidate_answers_dola_with_details(
+        model=model,
+        tokenizer=tokenizer,
+        prompt="Answer:",
+        candidate_answers=false_candidates,
+        premature_layer=0,
+        score_mode="sum_logprob",
+        dola_score_mode="official_static_dola",
+        mature_layer=2,
+        return_trace=True,
+        enable_token_selective_dola=True,
+    )
+
+    logger = TruthfulQAMCAnalysisLogger(tmp_path / "analysis_logs", max_examples=1)
+    assert logger.log_sample(
+        sample_idx=0,
+        sample=sample,
+        true_candidates=true_candidates,
+        false_candidates=false_candidates,
+        vanilla_true=vanilla_true,
+        vanilla_false=vanilla_false,
+        dola_true=dola_true,
+        dola_false=dola_false,
+        mature_layer=2,
+        num_hidden_layers=3,
+        premature_layer=0,
+        candidate_premature_layers=None,
+        dola_score_mode="official_static_dola",
+        score_mode="sum_logprob",
+    )
+
+    candidate_records = [
+        json.loads(line)
+        for line in logger.candidate_level_path.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert candidate_records[0]["token_selected_mask"] == [True]
+    assert candidate_records[0]["token_selected_reason"] == ["capitalized_lexical"]
+    assert candidate_records[0]["token_effective_score_source"] == ["contrast"]
+    assert candidate_records[0]["dola_token_effective_scores"] == candidate_records[0]["dola_token_contrast_scores"]

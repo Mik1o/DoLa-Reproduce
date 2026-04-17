@@ -117,6 +117,8 @@ def evaluate_compare_subset(
     relative_top_value: float = -1000.0,
     candidate_premature_layers: list[int] | None = None,
     mature_layer: int | None = None,
+    enable_token_selective_dola: bool = False,
+    token_selective_mode: str = "heuristic_fact_critical_v1",
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     analysis_logger: TruthfulQAMCAnalysisLogger | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float | int | str | dict[str, int] | list[int] | None]]:
@@ -195,6 +197,8 @@ def evaluate_compare_subset(
             candidate_premature_layers=resolved_candidate_layers,
             mature_layer=resolved_mature_layer,
             return_trace=log_analysis,
+            enable_token_selective_dola=enable_token_selective_dola,
+            token_selective_mode=token_selective_mode,
         )
         dola_false = score_candidate_answers_dola_with_details(
             model,
@@ -210,6 +214,8 @@ def evaluate_compare_subset(
             candidate_premature_layers=resolved_candidate_layers,
             mature_layer=resolved_mature_layer,
             return_trace=log_analysis,
+            enable_token_selective_dola=enable_token_selective_dola,
+            token_selective_mode=token_selective_mode,
         )
         dola_metrics = compute_mc_metrics(
             [item.score for item in dola_true],
@@ -236,6 +242,8 @@ def evaluate_compare_subset(
                 "premature_layer": premature_layer,
                 "candidate_premature_layers": resolved_candidate_layers or None,
                 "mature_layer": resolved_mature_layer,
+                "enable_token_selective_dola": enable_token_selective_dola,
+                "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
                 "vanilla": {
                     "true_scores": _serialize_candidate_scores(vanilla_true),
                     "false_scores": _serialize_candidate_scores(vanilla_false),
@@ -293,6 +301,8 @@ def evaluate_compare_subset(
             "mature_layer": resolved_mature_layer,
             "dola_pair": pair_description,
             "premature_layer_dist": _serialize_layer_dist(overall_layer_usage or None),
+            "enable_token_selective_dola": enable_token_selective_dola,
+            "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
         }
     )
     return sample_results, comparison_summary
@@ -321,6 +331,8 @@ def main() -> None:
     candidate_premature_layers = [int(layer) for layer in config.get("candidate_premature_layers", [])]
     mature_layer = config.get("mature_layer")
     mature_layer = None if mature_layer is None else int(mature_layer)
+    enable_token_selective_dola = bool(config.get("enable_token_selective_dola", False))
+    token_selective_mode = str(config.get("token_selective_mode", "heuristic_fact_critical_v1"))
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
     analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
@@ -331,6 +343,9 @@ def main() -> None:
     print(f"[hf_eval_compare_subset] Device: {device}")
     print(f"[hf_eval_compare_subset] Score mode: {score_mode}")
     print(f"[hf_eval_compare_subset] DoLa score mode: {dola_score_mode}")
+    print(f"[hf_eval_compare_subset] Token-selective DoLa: {enable_token_selective_dola}")
+    if enable_token_selective_dola:
+        print(f"[hf_eval_compare_subset] Token-selective mode: {token_selective_mode}")
     print(f"[hf_eval_compare_subset] Loaded samples: {len(samples)}")
     print(f"[hf_eval_compare_subset] Evaluating first {min(len(samples), max_samples)} samples")
     print(f"[hf_eval_compare_subset] Output directory: {output_dir}")
@@ -357,6 +372,8 @@ def main() -> None:
         relative_top_value=relative_top_value,
         candidate_premature_layers=candidate_premature_layers,
         mature_layer=mature_layer,
+        enable_token_selective_dola=enable_token_selective_dola,
+        token_selective_mode=token_selective_mode,
         analysis_logger=analysis_logger,
     )
 
