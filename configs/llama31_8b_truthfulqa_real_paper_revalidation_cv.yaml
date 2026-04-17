@@ -1,5 +1,5 @@
 task_name: "llama31_8b_truthfulqa_real_paper_revalidation_cv"
-model_name: "/home/yifei/DoLa-Reproduce/models/Llama-3.1-8B"
+model_name: "/root/rivermind-data/models/Llama-3.1-8B"
 model_label: "meta-llama/Llama-3.1-8B (base-assumed local copy)"
 device: "cuda"
 torch_dtype: "bfloat16"
