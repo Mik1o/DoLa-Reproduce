@@ -85,6 +85,8 @@ class CandidateScoreTrace:
     token_selected_mask: list[bool] | None = None
     token_selected_reason: list[str] | None = None
     token_effective_score_source: list[str] | None = None
+    token_contrast_weight: list[float] | None = None
+    token_selection_tier: list[str] | None = None
 
 
 @dataclass(slots=True)
@@ -107,6 +109,15 @@ class MultiConfigScoreResult:
 
 
 TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1 = "heuristic_fact_critical_v1"
+TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1_HARD = (
+    "heuristic_fact_critical_v1_hard"
+)
+TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V2_SOFT = (
+    "heuristic_fact_critical_v2_soft"
+)
+TOKEN_SELECTIVE_V2_STRONG_WEIGHT = 1.0
+TOKEN_SELECTIVE_V2_MEDIUM_WEIGHT = 0.5
+TOKEN_SELECTIVE_V2_UNSELECTED_WEIGHT = 0.2
 
 _TOKEN_SELECTIVE_DATE_WORDS = {
     "january",
@@ -182,6 +193,60 @@ _TOKEN_SELECTIVE_CAPITALIZED_EXCLUSIONS = {
     "Why",
     "Yes",
     "You",
+}
+
+_TOKEN_SELECTIVE_MEDIUM_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "because",
+    "been",
+    "before",
+    "being",
+    "between",
+    "both",
+    "but",
+    "could",
+    "does",
+    "down",
+    "each",
+    "from",
+    "have",
+    "here",
+    "into",
+    "itself",
+    "just",
+    "more",
+    "most",
+    "only",
+    "over",
+    "same",
+    "should",
+    "some",
+    "such",
+    "than",
+    "that",
+    "their",
+    "them",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "under",
+    "very",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "with",
+    "would",
+    "your",
 }
 
 
@@ -872,6 +937,8 @@ def score_continuation_dola_details(
         token_selected_mask: list[bool] | None = None
         token_selected_reason: list[str] | None = None
         token_effective_score_source: list[str] | None = None
+        token_contrast_weight: list[float] | None = None
+        token_selection_tier: list[str] | None = None
 
         if normalized_dola_mode == "legacy_contrastive":
             premature_hidden = hidden_states[
@@ -929,6 +996,8 @@ def score_continuation_dola_details(
                 token_selected_mask,
                 token_selected_reason,
                 token_effective_score_source,
+                token_contrast_weight,
+                token_selection_tier,
             ) = _apply_token_selective_dola_scores(
                 tokenizer=tokenizer,
                 input_ids=input_ids,
@@ -992,6 +1061,16 @@ def score_continuation_dola_details(
             token_effective_score_source=None
             if token_effective_score_source is None
             else token_effective_score_source[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+            token_contrast_weight=None
+            if token_contrast_weight is None
+            else token_contrast_weight[
+                continuation_start : continuation_start + continuation_token_count_for_trace
+            ],
+            token_selection_tier=None
+            if token_selection_tier is None
+            else token_selection_tier[
                 continuation_start : continuation_start + continuation_token_count_for_trace
             ],
         )
@@ -1589,6 +1668,8 @@ def _build_candidate_score_trace(
     token_selected_mask: list[bool] | None = None,
     token_selected_reason: list[str] | None = None,
     token_effective_score_source: list[str] | None = None,
+    token_contrast_weight: list[float] | None = None,
+    token_selection_tier: list[str] | None = None,
 ) -> CandidateScoreTrace:
     """Materialize JSON-friendly token-level scoring details on demand."""
     token_score_values = _tensor_first_row_to_float_list(token_scores)
@@ -1629,6 +1710,12 @@ def _build_candidate_score_trace(
         token_effective_score_source=None
         if token_effective_score_source is None
         else [str(source) for source in token_effective_score_source],
+        token_contrast_weight=None
+        if token_contrast_weight is None
+        else [float(weight) for weight in token_contrast_weight],
+        token_selection_tier=None
+        if token_selection_tier is None
+        else [str(tier) for tier in token_selection_tier],
     )
 
 
@@ -1690,8 +1777,8 @@ def _apply_token_selective_dola_scores(
     contrast_token_scores: Any,
     final_token_scores: Any,
     token_selective_mode: str,
-) -> tuple[Any, list[bool], list[str], list[str]]:
-    """Mix DoLa contrast scores only onto conservatively selected target tokens."""
+) -> tuple[Any, list[bool], list[str], list[str], list[float], list[str]]:
+    """Mix DoLa contrast scores through the requested token-selective policy."""
     try:
         import torch
     except ImportError as error:
@@ -1700,12 +1787,30 @@ def _apply_token_selective_dola_scores(
             "Install the extra model dependencies from requirements-model.txt."
         ) from error
 
-    normalized_mode = _normalize_token_selective_mode(token_selective_mode)
-    if normalized_mode != TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1:
-        raise ValueError(f"Unsupported token_selective_mode '{token_selective_mode}'.")
-
     target_token_ids = _tensor_first_row_to_int_list(input_ids[:, 1:])
     target_token_texts = _token_ids_to_texts(tokenizer, target_token_ids)
+    normalized_mode = _normalize_token_selective_mode(token_selective_mode)
+
+    if normalized_mode == TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V2_SOFT:
+        selected_mask, selected_reasons, contrast_weights, selection_tiers = (
+            _select_token_selective_dola_tokens_v2(target_token_texts)
+        )
+        weight_tensor = torch.tensor(
+            [contrast_weights],
+            dtype=contrast_token_scores.dtype,
+            device=contrast_token_scores.device,
+        )
+        effective_scores = final_token_scores + (weight_tensor * contrast_token_scores)
+        score_sources = ["soft_mixed"] * len(selected_mask)
+        return (
+            effective_scores,
+            selected_mask,
+            selected_reasons,
+            score_sources,
+            contrast_weights,
+            selection_tiers,
+        )
+
     selected_mask, selected_reasons = _select_token_selective_dola_tokens(target_token_texts)
     mask_tensor = torch.tensor(
         [selected_mask],
@@ -1717,7 +1822,16 @@ def _apply_token_selective_dola_scores(
         "contrast" if selected else "vanilla_final"
         for selected in selected_mask
     ]
-    return effective_scores, selected_mask, selected_reasons, score_sources
+    contrast_weights = [1.0 if selected else 0.0 for selected in selected_mask]
+    selection_tiers = ["strong" if selected else "unselected" for selected in selected_mask]
+    return (
+        effective_scores,
+        selected_mask,
+        selected_reasons,
+        score_sources,
+        contrast_weights,
+        selection_tiers,
+    )
 
 
 def _select_token_selective_dola_tokens(token_texts: list[str]) -> tuple[list[bool], list[str]]:
@@ -1731,10 +1845,69 @@ def _select_token_selective_dola_tokens(token_texts: list[str]) -> tuple[list[bo
     return selected_mask, selected_reasons
 
 
+def _select_token_selective_dola_tokens_v2(
+    token_texts: list[str],
+) -> tuple[list[bool], list[str], list[float], list[str]]:
+    """Return three-tier token-selection decisions for soft token-selective DoLa v2."""
+    strong_mask, strong_reasons = _select_token_selective_dola_tokens(token_texts)
+    selected_mask: list[bool] = []
+    selected_reasons: list[str] = []
+    contrast_weights: list[float] = []
+    selection_tiers: list[str] = []
+    previous_strong_can_extend = False
+    uses_word_boundaries = any(
+        _has_tokenizer_word_boundary(token_text)
+        for token_text in token_texts
+    )
+
+    for token_index, token_text in enumerate(token_texts):
+        clean_token = _clean_token_for_token_selective_dola(token_text)
+        stripped = _strip_token_selective_punctuation(clean_token)
+        is_continuation = _is_tokenizer_continuation_piece(
+            token_text,
+            token_index=token_index,
+            uses_word_boundaries=uses_word_boundaries,
+        )
+        is_alphaish = _is_alphaish_lexical_token(stripped)
+
+        if strong_mask[token_index]:
+            tier = "strong"
+            reason = strong_reasons[token_index]
+            weight = TOKEN_SELECTIVE_V2_STRONG_WEIGHT
+            previous_strong_can_extend = is_alphaish and _has_tokenizer_word_boundary(token_text)
+        elif previous_strong_can_extend and is_continuation and is_alphaish:
+            tier = "strong"
+            reason = "strong_continuation"
+            weight = TOKEN_SELECTIVE_V2_STRONG_WEIGHT
+            previous_strong_can_extend = True
+        else:
+            medium_reason = _medium_token_selective_reason_v2(
+                stripped,
+                token_index=token_index,
+                strong_mask=strong_mask,
+            )
+            if medium_reason:
+                tier = "medium"
+                reason = medium_reason
+                weight = TOKEN_SELECTIVE_V2_MEDIUM_WEIGHT
+            else:
+                tier = "unselected"
+                reason = ""
+                weight = TOKEN_SELECTIVE_V2_UNSELECTED_WEIGHT
+            previous_strong_can_extend = False
+
+        selected_mask.append(tier != "unselected")
+        selected_reasons.append(reason)
+        contrast_weights.append(weight)
+        selection_tiers.append(tier)
+
+    return selected_mask, selected_reasons, contrast_weights, selection_tiers
+
+
 def _select_token_for_token_selective_dola(token_text: str, *, token_index: int = 0) -> tuple[bool, str]:
     """Conservative lexical selector for fact-critical-ish answer tokens."""
     clean_token = _clean_token_for_token_selective_dola(token_text)
-    stripped = clean_token.strip(" \t\r\n\"'`.,;:!?()[]{}")
+    stripped = _strip_token_selective_punctuation(clean_token)
     if not stripped:
         return False, ""
 
@@ -1748,6 +1921,56 @@ def _select_token_for_token_selective_dola(token_text: str, *, token_index: int 
     if _is_conservative_capitalized_token(token_text, stripped, token_index=token_index):
         return True, "capitalized_lexical"
     return False, ""
+
+
+def _medium_token_selective_reason_v2(
+    stripped_token: str,
+    *,
+    token_index: int,
+    strong_mask: list[bool],
+) -> str:
+    """Allow obvious content words into v2 at a reduced contrast weight."""
+    if not _is_medium_lexical_token_v2(stripped_token):
+        return ""
+    adjacent_to_strong = (
+        (token_index > 0 and strong_mask[token_index - 1])
+        or (token_index + 1 < len(strong_mask) and strong_mask[token_index + 1])
+    )
+    if adjacent_to_strong:
+        return "medium_adjacent_support"
+    return "medium_lexical"
+
+
+def _is_medium_lexical_token_v2(stripped_token: str) -> bool:
+    if not _is_alphaish_lexical_token(stripped_token):
+        return False
+    if len(stripped_token) < 4:
+        return False
+    if stripped_token.lower() in _TOKEN_SELECTIVE_MEDIUM_STOPWORDS:
+        return False
+    return True
+
+
+def _is_alphaish_lexical_token(stripped_token: str) -> bool:
+    alpha_count = sum(1 for char in stripped_token if char.isalpha())
+    return alpha_count >= 2 and all(char.isalpha() or char in {"-", "'"} for char in stripped_token)
+
+
+def _strip_token_selective_punctuation(clean_token: str) -> str:
+    return clean_token.strip(" \t\r\n\"'`.,;:!?()[]{}")
+
+
+def _has_tokenizer_word_boundary(raw_token: str) -> bool:
+    return str(raw_token).startswith(("Ġ", "▁"))
+
+
+def _is_tokenizer_continuation_piece(
+    raw_token: str,
+    *,
+    token_index: int,
+    uses_word_boundaries: bool,
+) -> bool:
+    return token_index > 0 and uses_word_boundaries and not _has_tokenizer_word_boundary(raw_token)
 
 
 def _clean_token_for_token_selective_dola(token_text: str) -> str:
@@ -1825,10 +2048,17 @@ def _normalize_dola_score_mode(dola_score_mode: str) -> str:
 def _normalize_token_selective_mode(token_selective_mode: str) -> str:
     """Normalize the opt-in token-selective DoLa selector mode."""
     normalized_mode = token_selective_mode.strip().lower()
-    if normalized_mode != TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1:
+    if normalized_mode == TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1:
+        return TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1_HARD
+    if normalized_mode not in {
+        TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1_HARD,
+        TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V2_SOFT,
+    }:
         raise ValueError(
             "Unsupported token_selective_mode "
-            f"'{token_selective_mode}'. Use '{TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1}'."
+            f"'{token_selective_mode}'. Use "
+            f"'{TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1_HARD}' or "
+            f"'{TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V2_SOFT}'."
         )
     return normalized_mode
 

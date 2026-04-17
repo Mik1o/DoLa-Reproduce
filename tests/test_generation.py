@@ -23,6 +23,7 @@ from src.generation import (
     _prepare_scoring_inputs,
     _precompute_union_layer_dynamic_js,
     _select_token_selective_dola_tokens,
+    _select_token_selective_dola_tokens_v2,
     _select_dynamic_base_log_probs_from_union,
     score_candidate_answers_dola_with_details,
     score_candidate_answers_multi_config_with_details,
@@ -261,7 +262,7 @@ def test_token_selective_mixing_uses_contrast_only_for_selected_tokens() -> None
     contrast_scores = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32)
     final_scores = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
 
-    mixed_scores, mask, reasons, sources = _apply_token_selective_dola_scores(
+    mixed_scores, mask, reasons, sources, weights, tiers = _apply_token_selective_dola_scores(
         tokenizer=_SelectorTokenizer(),
         input_ids=input_ids,
         contrast_token_scores=contrast_scores,
@@ -273,6 +274,61 @@ def test_token_selective_mixing_uses_contrast_only_for_selected_tokens() -> None
     assert mask == [True, False, True]
     assert reasons == ["capitalized_lexical", "", "number"]
     assert sources == ["contrast", "vanilla_final", "contrast"]
+    assert weights == [1.0, 0.0, 1.0]
+    assert tiers == ["strong", "unselected", "strong"]
+
+
+def test_token_selective_v2_soft_mixing_uses_weighted_contrast() -> None:
+    """v2 should keep final scores and add a tiered fraction of contrast scores."""
+    torch = pytest.importorskip("torch")
+
+    class _SelectorTokenizer:
+        def convert_ids_to_tokens(self, token_ids):
+            mapping = {
+                1: "Prompt",
+                2: "ĠParis",
+                3: "Ġriver",
+                4: "Ġthe",
+                5: "Ġ2024",
+            }
+            return [mapping[int(token_id)] for token_id in token_ids]
+
+    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
+    contrast_scores = torch.tensor([[10.0, 20.0, 30.0, 40.0]], dtype=torch.float32)
+    final_scores = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.float32)
+
+    mixed_scores, mask, reasons, sources, weights, tiers = _apply_token_selective_dola_scores(
+        tokenizer=_SelectorTokenizer(),
+        input_ids=input_ids,
+        contrast_token_scores=contrast_scores,
+        final_token_scores=final_scores,
+        token_selective_mode="heuristic_fact_critical_v2_soft",
+    )
+
+    torch.testing.assert_close(mixed_scores, torch.tensor([[11.0, 12.0, 9.0, 44.0]]))
+    assert mask == [True, True, False, True]
+    assert reasons == ["capitalized_lexical", "medium_adjacent_support", "", "number"]
+    assert sources == ["soft_mixed", "soft_mixed", "soft_mixed", "soft_mixed"]
+    assert weights == [1.0, 0.5, 0.2, 1.0]
+    assert tiers == ["strong", "medium", "unselected", "strong"]
+
+
+def test_token_selective_v2_selector_inherits_strong_continuation_and_medium_words() -> None:
+    """v2 should keep fact-like subword continuations and lowercase content words."""
+    mask, reasons, weights, tiers = _select_token_selective_dola_tokens_v2(
+        ["ĠPaul", "Re", "vere", "Ġriver", "Ġthe"]
+    )
+
+    assert mask == [True, True, True, True, False]
+    assert reasons == [
+        "capitalized_lexical",
+        "strong_continuation",
+        "strong_continuation",
+        "medium_lexical",
+        "",
+    ]
+    assert weights == [1.0, 1.0, 1.0, 0.5, 0.2]
+    assert tiers == ["strong", "strong", "strong", "medium", "unselected"]
 
 
 class _ToyTokenizer:
@@ -936,6 +992,7 @@ def test_truthfulqa_analysis_logger_writes_token_selective_fields(tmp_path) -> N
         mature_layer=2,
         return_trace=True,
         enable_token_selective_dola=True,
+        token_selective_mode="heuristic_fact_critical_v2_soft",
     )
     dola_false = score_candidate_answers_dola_with_details(
         model=model,
@@ -948,6 +1005,7 @@ def test_truthfulqa_analysis_logger_writes_token_selective_fields(tmp_path) -> N
         mature_layer=2,
         return_trace=True,
         enable_token_selective_dola=True,
+        token_selective_mode="heuristic_fact_critical_v2_soft",
     )
 
     logger = TruthfulQAMCAnalysisLogger(tmp_path / "analysis_logs", max_examples=1)
@@ -975,5 +1033,14 @@ def test_truthfulqa_analysis_logger_writes_token_selective_fields(tmp_path) -> N
 
     assert candidate_records[0]["token_selected_mask"] == [True]
     assert candidate_records[0]["token_selected_reason"] == ["capitalized_lexical"]
-    assert candidate_records[0]["token_effective_score_source"] == ["contrast"]
-    assert candidate_records[0]["dola_token_effective_scores"] == candidate_records[0]["dola_token_contrast_scores"]
+    assert candidate_records[0]["token_effective_score_source"] == ["soft_mixed"]
+    assert candidate_records[0]["token_contrast_weight"] == [1.0]
+    assert candidate_records[0]["token_selection_tier"] == ["strong"]
+    expected_effective_score = (
+        candidate_records[0]["dola_final_token_scores"][0]
+        + candidate_records[0]["dola_token_contrast_scores"][0]
+    )
+    assert candidate_records[0]["dola_token_effective_scores"][0] == pytest.approx(
+        expected_effective_score,
+        abs=1e-6,
+    )

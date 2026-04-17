@@ -211,6 +211,8 @@ def build_truthfulqa_mc_analysis_records(
                         dola_trace,
                         "token_effective_score_source",
                     ),
+                    "token_contrast_weight": _trace_list(dola_trace, "token_contrast_weight"),
+                    "token_selection_tier": _trace_list(dola_trace, "token_selection_tier"),
                 }
             )
         candidate_records.append(candidate_record)
