@@ -25,5 +25,6 @@ checkpoints/
 # Notebook and editor noise
 .ipynb_checkpoints/
 .vscode/
+.DS_Store
 
 models/

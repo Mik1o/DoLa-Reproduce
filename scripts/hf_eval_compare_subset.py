@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +51,10 @@ LOAD_CONFIG_KEYS = (
     "bnb_4bit_use_double_quant",
     "tokenizer_class",
 )
+
+PROGRESS_LOG_SECONDS = 30.0
+PROGRESS_SAMPLE_STRIDE = 5
+PROGRESS_EARLY_SAMPLE_LIMIT = 5
 
 
 
@@ -99,6 +105,66 @@ def _aggregate_layer_usage(items: list[object]) -> dict[int, int] | None:
         for layer, count in layer_dist.items():
             aggregate[int(layer)] = aggregate.get(int(layer), 0) + int(count)
     return aggregate or None
+
+
+class ProgressReporter:
+    """Lightweight stdout progress reporter with elapsed time and ETA."""
+
+    def __init__(self, *, label: str) -> None:
+        self.label = label
+        self.start_time = time.perf_counter()
+        self.last_log_time = self.start_time
+        self.last_logged_sample = 0
+
+    def start(self, *, total_samples: int) -> None:
+        self._log(completed_samples=0, total_samples=total_samples)
+
+    def __call__(self, event: dict[str, object]) -> None:
+        completed_samples = int(event["completed_samples"])
+        total_samples = int(event["total_samples"])
+        now = time.perf_counter()
+        should_log = (
+            completed_samples <= PROGRESS_EARLY_SAMPLE_LIMIT
+            or completed_samples == total_samples
+            or completed_samples - self.last_logged_sample >= PROGRESS_SAMPLE_STRIDE
+            or now - self.last_log_time >= PROGRESS_LOG_SECONDS
+        )
+        if not should_log:
+            return
+        self.last_logged_sample = completed_samples
+        self.last_log_time = now
+        self._log(completed_samples=completed_samples, total_samples=total_samples)
+
+    def _log(self, *, completed_samples: int, total_samples: int) -> None:
+        elapsed = time.perf_counter() - self.start_time
+        avg_sample_seconds = elapsed / completed_samples if completed_samples > 0 else 0.0
+        remaining_samples = max(total_samples - completed_samples, 0)
+        eta_seconds = avg_sample_seconds * remaining_samples if completed_samples > 0 else 0.0
+        eta_at = datetime.now() + timedelta(seconds=eta_seconds)
+        percent = 100.0 * completed_samples / total_samples if total_samples > 0 else 0.0
+        print(
+            f"[hf_eval_compare_subset] {_progress_bar(completed_samples, total_samples)} "
+            f"{percent:5.1f}% | {self.label} | {completed_samples}/{total_samples} samples "
+            f"| elapsed={_format_seconds(elapsed)} | avg_sample_s={avg_sample_seconds:.2f} "
+            f"| eta={_format_seconds(eta_seconds)} | eta_at={eta_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            flush=True,
+        )
+
+
+def _progress_bar(completed: int, total: int, width: int = 24) -> str:
+    if total <= 0:
+        return "[" + "-" * width + "]"
+    filled = int(width * min(max(completed / total, 0.0), 1.0))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
+
+
+def _format_seconds(seconds: float) -> str:
+    seconds = max(float(seconds), 0.0)
+    if seconds >= 3600:
+        return f"{seconds / 3600:.2f}h"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f}m"
+    return f"{seconds:.1f}s"
 
 
 
@@ -358,6 +424,15 @@ def main() -> None:
         **model_kwargs,
     )
 
+    progress_reporter = ProgressReporter(
+        label=(
+            "token-selective compare"
+            if enable_token_selective_dola
+            else "compare"
+        )
+    )
+    progress_reporter.start(total_samples=min(len(samples), max_samples))
+
     sample_results, comparison_summary = evaluate_compare_subset(
         model,
         tokenizer,
@@ -374,6 +449,7 @@ def main() -> None:
         mature_layer=mature_layer,
         enable_token_selective_dola=enable_token_selective_dola,
         token_selective_mode=token_selective_mode,
+        progress_callback=progress_reporter,
         analysis_logger=analysis_logger,
     )
 
