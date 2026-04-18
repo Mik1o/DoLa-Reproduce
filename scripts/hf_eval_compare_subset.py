@@ -25,7 +25,11 @@ from src.dola_utils import (
     validate_candidate_premature_layers,
     validate_mature_layer,
 )
-from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
+from src.generation import (
+    TokenSelectiveDolaConfig,
+    score_candidate_answers_dola_with_details,
+    score_candidate_answers_with_details,
+)
 from src.metrics import (
     aggregate_mc_metrics,
     compare_aggregate_metrics,
@@ -185,6 +189,7 @@ def evaluate_compare_subset(
     mature_layer: int | None = None,
     enable_token_selective_dola: bool = False,
     token_selective_mode: str = "heuristic_fact_critical_v1",
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
     progress_callback: Callable[[dict[str, object]], None] | None = None,
     analysis_logger: TruthfulQAMCAnalysisLogger | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, float | int | str | dict[str, int] | list[int] | None]]:
@@ -265,6 +270,7 @@ def evaluate_compare_subset(
             return_trace=log_analysis,
             enable_token_selective_dola=enable_token_selective_dola,
             token_selective_mode=token_selective_mode,
+            token_selective_config=token_selective_config,
         )
         dola_false = score_candidate_answers_dola_with_details(
             model,
@@ -282,6 +288,7 @@ def evaluate_compare_subset(
             return_trace=log_analysis,
             enable_token_selective_dola=enable_token_selective_dola,
             token_selective_mode=token_selective_mode,
+            token_selective_config=token_selective_config,
         )
         dola_metrics = compute_mc_metrics(
             [item.score for item in dola_true],
@@ -310,6 +317,11 @@ def evaluate_compare_subset(
                 "mature_layer": resolved_mature_layer,
                 "enable_token_selective_dola": enable_token_selective_dola,
                 "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
+                "token_selective_config": (
+                    token_selective_config.to_config_dict()
+                    if enable_token_selective_dola and token_selective_config is not None
+                    else None
+                ),
                 "vanilla": {
                     "true_scores": _serialize_candidate_scores(vanilla_true),
                     "false_scores": _serialize_candidate_scores(vanilla_false),
@@ -369,6 +381,11 @@ def evaluate_compare_subset(
             "premature_layer_dist": _serialize_layer_dist(overall_layer_usage or None),
             "enable_token_selective_dola": enable_token_selective_dola,
             "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
+            "token_selective_config": (
+                token_selective_config.to_config_dict()
+                if enable_token_selective_dola and token_selective_config is not None
+                else None
+            ),
         }
     )
     return sample_results, comparison_summary
@@ -399,6 +416,7 @@ def main() -> None:
     mature_layer = None if mature_layer is None else int(mature_layer)
     enable_token_selective_dola = bool(config.get("enable_token_selective_dola", False))
     token_selective_mode = str(config.get("token_selective_mode", "heuristic_fact_critical_v1"))
+    token_selective_config = TokenSelectiveDolaConfig.from_mapping(config)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
     analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
@@ -412,6 +430,10 @@ def main() -> None:
     print(f"[hf_eval_compare_subset] Token-selective DoLa: {enable_token_selective_dola}")
     if enable_token_selective_dola:
         print(f"[hf_eval_compare_subset] Token-selective mode: {token_selective_mode}")
+        print(
+            "[hf_eval_compare_subset] Token-selective config: "
+            f"{json.dumps(token_selective_config.to_config_dict(), sort_keys=True)}"
+        )
     print(f"[hf_eval_compare_subset] Loaded samples: {len(samples)}")
     print(f"[hf_eval_compare_subset] Evaluating first {min(len(samples), max_samples)} samples")
     print(f"[hf_eval_compare_subset] Output directory: {output_dir}")
@@ -449,6 +471,7 @@ def main() -> None:
         mature_layer=mature_layer,
         enable_token_selective_dola=enable_token_selective_dola,
         token_selective_mode=token_selective_mode,
+        token_selective_config=token_selective_config,
         progress_callback=progress_reporter,
         analysis_logger=analysis_logger,
     )

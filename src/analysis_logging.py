@@ -205,6 +205,13 @@ def build_truthfulqa_mc_analysis_records(
             candidate_record.update(
                 {
                     "dola_token_effective_scores": _trace_list(dola_trace, "token_scores"),
+                    "token_effective_score": _trace_list(dola_trace, "token_scores"),
+                    "token_vanilla_final_score": _trace_list(dola_trace, "final_token_scores"),
+                    "token_contrast_score": _trace_list(
+                        dola_trace,
+                        "contrast_token_scores",
+                        fallback_field_name="token_scores",
+                    ),
                     "token_selected_mask": _trace_list(dola_trace, "token_selected_mask"),
                     "token_selected_reason": _trace_list(dola_trace, "token_selected_reason"),
                     "token_effective_score_source": _trace_list(

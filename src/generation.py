@@ -250,6 +250,77 @@ _TOKEN_SELECTIVE_MEDIUM_STOPWORDS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class TokenSelectiveDolaConfig:
+    """Configuration for opt-in token-selective DoLa ablations."""
+
+    strong_weight: float = TOKEN_SELECTIVE_V2_STRONG_WEIGHT
+    medium_weight: float = TOKEN_SELECTIVE_V2_MEDIUM_WEIGHT
+    unselected_weight: float = TOKEN_SELECTIVE_V2_UNSELECTED_WEIGHT
+    selector_enable_number: bool = True
+    selector_enable_date_word: bool = True
+    selector_enable_relation_word: bool = True
+    selector_enable_capitalized_lexical: bool = True
+    selector_enable_strong_continuation_inheritance: bool = True
+    selector_enable_lowercase_medium: bool = True
+    selector_enable_adjacent_support_medium: bool = True
+
+    def __post_init__(self) -> None:
+        _validate_token_selective_weight(self.strong_weight, "token_selective_strong_weight")
+        _validate_token_selective_weight(self.medium_weight, "token_selective_medium_weight")
+        _validate_token_selective_weight(self.unselected_weight, "token_selective_unselected_weight")
+
+    @classmethod
+    def from_mapping(cls, config: dict[str, Any]) -> "TokenSelectiveDolaConfig":
+        """Build from YAML-style config keys while preserving v2 defaults."""
+        return cls(
+            strong_weight=float(config.get("token_selective_strong_weight", TOKEN_SELECTIVE_V2_STRONG_WEIGHT)),
+            medium_weight=float(config.get("token_selective_medium_weight", TOKEN_SELECTIVE_V2_MEDIUM_WEIGHT)),
+            unselected_weight=float(
+                config.get("token_selective_unselected_weight", TOKEN_SELECTIVE_V2_UNSELECTED_WEIGHT)
+            ),
+            selector_enable_number=bool(config.get("selector_enable_number", True)),
+            selector_enable_date_word=bool(config.get("selector_enable_date_word", True)),
+            selector_enable_relation_word=bool(config.get("selector_enable_relation_word", True)),
+            selector_enable_capitalized_lexical=bool(config.get("selector_enable_capitalized_lexical", True)),
+            selector_enable_strong_continuation_inheritance=bool(
+                config.get("selector_enable_strong_continuation_inheritance", True)
+            ),
+            selector_enable_lowercase_medium=bool(config.get("selector_enable_lowercase_medium", True)),
+            selector_enable_adjacent_support_medium=bool(
+                config.get("selector_enable_adjacent_support_medium", True)
+            ),
+        )
+
+    def to_config_dict(self) -> dict[str, bool | float]:
+        """Serialize using the YAML key names used by experiment configs."""
+        return {
+            "token_selective_strong_weight": float(self.strong_weight),
+            "token_selective_medium_weight": float(self.medium_weight),
+            "token_selective_unselected_weight": float(self.unselected_weight),
+            "selector_enable_number": bool(self.selector_enable_number),
+            "selector_enable_date_word": bool(self.selector_enable_date_word),
+            "selector_enable_relation_word": bool(self.selector_enable_relation_word),
+            "selector_enable_capitalized_lexical": bool(self.selector_enable_capitalized_lexical),
+            "selector_enable_strong_continuation_inheritance": bool(
+                self.selector_enable_strong_continuation_inheritance
+            ),
+            "selector_enable_lowercase_medium": bool(self.selector_enable_lowercase_medium),
+            "selector_enable_adjacent_support_medium": bool(self.selector_enable_adjacent_support_medium),
+        }
+
+
+def _validate_token_selective_weight(value: float, name: str) -> None:
+    if not math.isfinite(float(value)) or float(value) < 0.0:
+        raise ValueError(f"{name} must be a finite non-negative float.")
+
+
+def _resolve_token_selective_config(
+    token_selective_config: TokenSelectiveDolaConfig | None,
+) -> TokenSelectiveDolaConfig:
+    return token_selective_config or TokenSelectiveDolaConfig()
+
+
 
 def generate_vanilla(
     model: Any,
@@ -420,6 +491,7 @@ def score_continuation_dola_logprob(
     mature_layer: int | None = None,
     enable_token_selective_dola: bool = False,
     token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> float:
     """Score a continuation with configurable DoLa-style scoring."""
     return score_continuation_dola_details(
@@ -438,6 +510,7 @@ def score_continuation_dola_logprob(
         mature_layer=mature_layer,
         enable_token_selective_dola=enable_token_selective_dola,
         token_selective_mode=token_selective_mode,
+        token_selective_config=token_selective_config,
     ).score
 
 
@@ -458,6 +531,7 @@ def score_candidate_answers_dola(
     mature_layer: int | None = None,
     enable_token_selective_dola: bool = False,
     token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> list[tuple[str, float]]:
     """Score each candidate answer with configurable DoLa-style scoring."""
     return [
@@ -478,6 +552,7 @@ def score_candidate_answers_dola(
             mature_layer=mature_layer,
             enable_token_selective_dola=enable_token_selective_dola,
             token_selective_mode=token_selective_mode,
+            token_selective_config=token_selective_config,
         )
     ]
 
@@ -500,6 +575,7 @@ def score_candidate_answers_dola_with_details(
     return_trace: bool = False,
     enable_token_selective_dola: bool = False,
     token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> list[CandidateScore]:
     """Score each candidate answer with DoLa-style scoring and token counts."""
     if not candidate_answers:
@@ -523,6 +599,7 @@ def score_candidate_answers_dola_with_details(
             return_trace=return_trace,
             enable_token_selective_dola=enable_token_selective_dola,
             token_selective_mode=token_selective_mode,
+            token_selective_config=token_selective_config,
         )
         for candidate_answer in candidate_answers
     ]
@@ -863,6 +940,7 @@ def score_continuation_dola_details(
     return_trace: bool = False,
     enable_token_selective_dola: bool = False,
     token_selective_mode: str = TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V1,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> CandidateScore:
     """Score one candidate with configurable DoLa-style scoring and token counts.
 
@@ -1004,6 +1082,7 @@ def score_continuation_dola_details(
                 contrast_token_scores=contrast_token_scores,
                 final_token_scores=final_target_scores,
                 token_selective_mode=normalized_token_selective_mode,
+                token_selective_config=token_selective_config,
             )
 
         if return_trace:
@@ -1777,6 +1856,7 @@ def _apply_token_selective_dola_scores(
     contrast_token_scores: Any,
     final_token_scores: Any,
     token_selective_mode: str,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> tuple[Any, list[bool], list[str], list[str], list[float], list[str]]:
     """Mix DoLa contrast scores through the requested token-selective policy."""
     try:
@@ -1792,8 +1872,12 @@ def _apply_token_selective_dola_scores(
     normalized_mode = _normalize_token_selective_mode(token_selective_mode)
 
     if normalized_mode == TOKEN_SELECTIVE_DOLA_MODE_HEURISTIC_FACT_CRITICAL_V2_SOFT:
+        resolved_config = _resolve_token_selective_config(token_selective_config)
         selected_mask, selected_reasons, contrast_weights, selection_tiers = (
-            _select_token_selective_dola_tokens_v2(target_token_texts)
+            _select_token_selective_dola_tokens_v2(
+                target_token_texts,
+                token_selective_config=resolved_config,
+            )
         )
         weight_tensor = torch.tensor(
             [contrast_weights],
@@ -1834,12 +1918,21 @@ def _apply_token_selective_dola_scores(
     )
 
 
-def _select_token_selective_dola_tokens(token_texts: list[str]) -> tuple[list[bool], list[str]]:
+def _select_token_selective_dola_tokens(
+    token_texts: list[str],
+    *,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
+) -> tuple[list[bool], list[str]]:
     """Return conservative token-selection decisions for token-selective DoLa v1."""
+    resolved_config = _resolve_token_selective_config(token_selective_config)
     selected_mask: list[bool] = []
     selected_reasons: list[str] = []
     for token_index, token_text in enumerate(token_texts):
-        selected, reason = _select_token_for_token_selective_dola(token_text, token_index=token_index)
+        selected, reason = _select_token_for_token_selective_dola(
+            token_text,
+            token_index=token_index,
+            token_selective_config=resolved_config,
+        )
         selected_mask.append(selected)
         selected_reasons.append(reason)
     return selected_mask, selected_reasons
@@ -1847,9 +1940,15 @@ def _select_token_selective_dola_tokens(token_texts: list[str]) -> tuple[list[bo
 
 def _select_token_selective_dola_tokens_v2(
     token_texts: list[str],
+    *,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> tuple[list[bool], list[str], list[float], list[str]]:
     """Return three-tier token-selection decisions for soft token-selective DoLa v2."""
-    strong_mask, strong_reasons = _select_token_selective_dola_tokens(token_texts)
+    resolved_config = _resolve_token_selective_config(token_selective_config)
+    strong_mask, strong_reasons = _select_token_selective_dola_tokens(
+        token_texts,
+        token_selective_config=resolved_config,
+    )
     selected_mask: list[bool] = []
     selected_reasons: list[str] = []
     contrast_weights: list[float] = []
@@ -1873,27 +1972,33 @@ def _select_token_selective_dola_tokens_v2(
         if strong_mask[token_index]:
             tier = "strong"
             reason = strong_reasons[token_index]
-            weight = TOKEN_SELECTIVE_V2_STRONG_WEIGHT
+            weight = float(resolved_config.strong_weight)
             previous_strong_can_extend = is_alphaish and _has_tokenizer_word_boundary(token_text)
-        elif previous_strong_can_extend and is_continuation and is_alphaish:
+        elif (
+            resolved_config.selector_enable_strong_continuation_inheritance
+            and previous_strong_can_extend
+            and is_continuation
+            and is_alphaish
+        ):
             tier = "strong"
             reason = "strong_continuation"
-            weight = TOKEN_SELECTIVE_V2_STRONG_WEIGHT
+            weight = float(resolved_config.strong_weight)
             previous_strong_can_extend = True
         else:
             medium_reason = _medium_token_selective_reason_v2(
                 stripped,
                 token_index=token_index,
                 strong_mask=strong_mask,
+                token_selective_config=resolved_config,
             )
             if medium_reason:
                 tier = "medium"
                 reason = medium_reason
-                weight = TOKEN_SELECTIVE_V2_MEDIUM_WEIGHT
+                weight = float(resolved_config.medium_weight)
             else:
                 tier = "unselected"
                 reason = ""
-                weight = TOKEN_SELECTIVE_V2_UNSELECTED_WEIGHT
+                weight = float(resolved_config.unselected_weight)
             previous_strong_can_extend = False
 
         selected_mask.append(tier != "unselected")
@@ -1904,21 +2009,30 @@ def _select_token_selective_dola_tokens_v2(
     return selected_mask, selected_reasons, contrast_weights, selection_tiers
 
 
-def _select_token_for_token_selective_dola(token_text: str, *, token_index: int = 0) -> tuple[bool, str]:
+def _select_token_for_token_selective_dola(
+    token_text: str,
+    *,
+    token_index: int = 0,
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
+) -> tuple[bool, str]:
     """Conservative lexical selector for fact-critical-ish answer tokens."""
+    resolved_config = _resolve_token_selective_config(token_selective_config)
     clean_token = _clean_token_for_token_selective_dola(token_text)
     stripped = _strip_token_selective_punctuation(clean_token)
     if not stripped:
         return False, ""
 
     lower = stripped.lower()
-    if any(char.isdigit() for char in stripped):
+    if resolved_config.selector_enable_number and any(char.isdigit() for char in stripped):
         return True, "number"
-    if lower in _TOKEN_SELECTIVE_DATE_WORDS:
+    if resolved_config.selector_enable_date_word and lower in _TOKEN_SELECTIVE_DATE_WORDS:
         return True, "date_word"
-    if lower in _TOKEN_SELECTIVE_RELATION_WORDS:
+    if resolved_config.selector_enable_relation_word and lower in _TOKEN_SELECTIVE_RELATION_WORDS:
         return True, "relation_word"
-    if _is_conservative_capitalized_token(token_text, stripped, token_index=token_index):
+    if (
+        resolved_config.selector_enable_capitalized_lexical
+        and _is_conservative_capitalized_token(token_text, stripped, token_index=token_index)
+    ):
         return True, "capitalized_lexical"
     return False, ""
 
@@ -1928,17 +2042,21 @@ def _medium_token_selective_reason_v2(
     *,
     token_index: int,
     strong_mask: list[bool],
+    token_selective_config: TokenSelectiveDolaConfig | None = None,
 ) -> str:
     """Allow obvious content words into v2 at a reduced contrast weight."""
+    resolved_config = _resolve_token_selective_config(token_selective_config)
     if not _is_medium_lexical_token_v2(stripped_token):
         return ""
     adjacent_to_strong = (
         (token_index > 0 and strong_mask[token_index - 1])
         or (token_index + 1 < len(strong_mask) and strong_mask[token_index + 1])
     )
-    if adjacent_to_strong:
+    if adjacent_to_strong and resolved_config.selector_enable_adjacent_support_medium:
         return "medium_adjacent_support"
-    return "medium_lexical"
+    if resolved_config.selector_enable_lowercase_medium:
+        return "medium_lexical"
+    return ""
 
 
 def _is_medium_lexical_token_v2(stripped_token: str) -> bool:

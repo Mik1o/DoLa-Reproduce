@@ -19,7 +19,11 @@ from src.dola_utils import (
     validate_candidate_premature_layers,
     validate_mature_layer,
 )
-from src.generation import score_candidate_answers_dola_with_details, score_candidate_answers_with_details
+from src.generation import (
+    TokenSelectiveDolaConfig,
+    score_candidate_answers_dola_with_details,
+    score_candidate_answers_with_details,
+)
 from src.metrics import compute_mc_metrics, format_metrics
 from src.modeling import load_model_and_tokenizer
 from src.truthfulqa_mc import build_mc_prompt, get_mc_candidate_sets, load_truthfulqa_samples
@@ -117,6 +121,7 @@ def main() -> None:
     mature_layer = None if mature_layer is None else int(mature_layer)
     enable_token_selective_dola = bool(config.get("enable_token_selective_dola", False))
     token_selective_mode = str(config.get("token_selective_mode", "heuristic_fact_critical_v1"))
+    token_selective_config = TokenSelectiveDolaConfig.from_mapping(config)
 
     model_kwargs = {key: config[key] for key in LOAD_CONFIG_KEYS if key in config}
     analysis_logger = maybe_create_truthfulqa_mc_analysis_logger(config, output_dir=output_dir)
@@ -138,6 +143,10 @@ def main() -> None:
     print(f"[hf_compare_single_mc] Token-selective DoLa: {enable_token_selective_dola}")
     if enable_token_selective_dola:
         print(f"[hf_compare_single_mc] Token-selective mode: {token_selective_mode}")
+        print(
+            "[hf_compare_single_mc] Token-selective config: "
+            f"{json.dumps(token_selective_config.to_config_dict(), sort_keys=True)}"
+        )
     print(f"[hf_compare_single_mc] Output directory: {output_dir}")
     if analysis_logger is not None:
         print(f"[hf_compare_single_mc] Analysis log directory: {analysis_logger.log_dir}")
@@ -208,6 +217,7 @@ def main() -> None:
         return_trace=log_analysis,
         enable_token_selective_dola=enable_token_selective_dola,
         token_selective_mode=token_selective_mode,
+        token_selective_config=token_selective_config,
     )
     dola_false = score_candidate_answers_dola_with_details(
         model,
@@ -225,6 +235,7 @@ def main() -> None:
         return_trace=log_analysis,
         enable_token_selective_dola=enable_token_selective_dola,
         token_selective_mode=token_selective_mode,
+        token_selective_config=token_selective_config,
     )
     dola_metrics = compute_mc_metrics(
         [item.score for item in dola_true],
@@ -259,6 +270,11 @@ def main() -> None:
         "mature_layer": resolved_mature_layer,
         "enable_token_selective_dola": enable_token_selective_dola,
         "token_selective_mode": token_selective_mode if enable_token_selective_dola else None,
+        "token_selective_config": (
+            token_selective_config.to_config_dict()
+            if enable_token_selective_dola
+            else None
+        ),
         "vanilla": {
             "true_scores": _serialize_candidate_scores(vanilla_true),
             "false_scores": _serialize_candidate_scores(vanilla_false),

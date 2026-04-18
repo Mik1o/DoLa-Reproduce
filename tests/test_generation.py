@@ -10,6 +10,7 @@ from src.analysis_logging import (
     maybe_create_truthfulqa_mc_analysis_logger,
 )
 from src.generation import (
+    TokenSelectiveDolaConfig,
     _aggregate_continuation_log_probs,
     _apply_token_selective_dola_scores,
     _build_scoring_text_attempts,
@@ -277,6 +278,22 @@ def test_token_selective_mixing_uses_contrast_only_for_selected_tokens() -> None
     assert weights == [1.0, 0.0, 1.0]
     assert tiers == ["strong", "unselected", "strong"]
 
+    disabled_selector_config = TokenSelectiveDolaConfig(
+        selector_enable_number=False,
+        selector_enable_capitalized_lexical=False,
+    )
+    disabled_config_scores, disabled_mask, disabled_reasons, _, _, _ = _apply_token_selective_dola_scores(
+        tokenizer=_SelectorTokenizer(),
+        input_ids=input_ids,
+        contrast_token_scores=contrast_scores,
+        final_token_scores=final_scores,
+        token_selective_mode="heuristic_fact_critical_v1",
+        token_selective_config=disabled_selector_config,
+    )
+    torch.testing.assert_close(disabled_config_scores, mixed_scores)
+    assert disabled_mask == mask
+    assert disabled_reasons == reasons
+
 
 def test_token_selective_v2_soft_mixing_uses_weighted_contrast() -> None:
     """v2 should keep final scores and add a tiered fraction of contrast scores."""
@@ -313,6 +330,39 @@ def test_token_selective_v2_soft_mixing_uses_weighted_contrast() -> None:
     assert tiers == ["strong", "medium", "unselected", "strong"]
 
 
+def test_token_selective_v2_default_config_preserves_current_behavior() -> None:
+    """Omitted ablation knobs should match the original v2 soft behavior."""
+    torch = pytest.importorskip("torch")
+
+    class _SelectorTokenizer:
+        def convert_ids_to_tokens(self, token_ids):
+            mapping = {1: "Prompt", 2: "ĠParis", 3: "Ġriver", 4: "Ġthe"}
+            return [mapping[int(token_id)] for token_id in token_ids]
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    contrast_scores = torch.tensor([[10.0, 20.0, 30.0]], dtype=torch.float32)
+    final_scores = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
+
+    default_result = _apply_token_selective_dola_scores(
+        tokenizer=_SelectorTokenizer(),
+        input_ids=input_ids,
+        contrast_token_scores=contrast_scores,
+        final_token_scores=final_scores,
+        token_selective_mode="heuristic_fact_critical_v2_soft",
+    )
+    explicit_result = _apply_token_selective_dola_scores(
+        tokenizer=_SelectorTokenizer(),
+        input_ids=input_ids,
+        contrast_token_scores=contrast_scores,
+        final_token_scores=final_scores,
+        token_selective_mode="heuristic_fact_critical_v2_soft",
+        token_selective_config=TokenSelectiveDolaConfig(),
+    )
+
+    torch.testing.assert_close(default_result[0], explicit_result[0])
+    assert default_result[1:] == explicit_result[1:]
+
+
 def test_token_selective_v2_selector_inherits_strong_continuation_and_medium_words() -> None:
     """v2 should keep fact-like subword continuations and lowercase content words."""
     mask, reasons, weights, tiers = _select_token_selective_dola_tokens_v2(
@@ -329,6 +379,26 @@ def test_token_selective_v2_selector_inherits_strong_continuation_and_medium_wor
     ]
     assert weights == [1.0, 1.0, 1.0, 0.5, 0.2]
     assert tiers == ["strong", "strong", "strong", "medium", "unselected"]
+
+
+def test_token_selective_v2_selector_toggles_rules() -> None:
+    """Ablation toggles should disable individual selector sources."""
+    config = TokenSelectiveDolaConfig(
+        selector_enable_number=False,
+        selector_enable_capitalized_lexical=False,
+        selector_enable_lowercase_medium=False,
+        selector_enable_adjacent_support_medium=False,
+    )
+
+    mask, reasons, weights, tiers = _select_token_selective_dola_tokens_v2(
+        ["ĠParis", "Ġ2024", "Ġriver"],
+        token_selective_config=config,
+    )
+
+    assert mask == [False, False, False]
+    assert reasons == ["", "", ""]
+    assert weights == [0.2, 0.2, 0.2]
+    assert tiers == ["unselected", "unselected", "unselected"]
 
 
 class _ToyTokenizer:
